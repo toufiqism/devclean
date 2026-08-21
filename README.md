@@ -33,74 +33,141 @@ Python 3 standard library only. No dependencies, no install step, one file.
 
 ## Install
 
-It's a single file with no dependencies, so installing means putting it
-somewhere on your `PATH` and making it executable.
+`devclean` is a single file with no dependencies, so installing it means putting
+that one file somewhere on your `PATH`.
 
-**Clone the repo** — best if you want to read the source first or pull updates:
+**Read it before you run it.** It deletes things, and that isn't something to
+take on trust from a stranger's README. Every recipe below downloads the file
+first and runs it second, which leaves you a moment to look:
 
 ```sh
-git clone https://github.com/toufiqism/devclean.git
-install -m 755 devclean/devclean ~/bin/devclean
+less ~/bin/devclean        # or: notepad %LOCALAPPDATA%\Programs\devclean\devclean.py
 ```
 
-**Or grab just the script:**
+### macOS
+
+Python 3 arrives with the Xcode Command Line Tools; run `xcode-select --install`
+if you don't have them yet.
 
 ```sh
 mkdir -p ~/bin
 curl -fsSL -o ~/bin/devclean \
   https://raw.githubusercontent.com/toufiqism/devclean/main/devclean
 chmod +x ~/bin/devclean
-```
 
-Read it before you run it — it deletes things, and you should not take that on
-trust from a stranger's README:
-
-```sh
-less ~/bin/devclean
-```
-
-If `~/bin` isn't on your `PATH` yet, add it to your shell profile — `~/.zprofile`
-for zsh (the macOS default), `~/.bashrc` for bash:
-
-```sh
+# zsh is the default shell on macOS
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zprofile
-exec $SHELL
+exec zsh
 ```
 
-On Windows, put `devclean` anywhere on `PATH` and run it with `python`:
-
-```powershell
-mkdir $HOME\bin -Force
-curl.exe -fsSL -o $HOME\bin\devclean.py `
-  https://raw.githubusercontent.com/toufiqism/devclean/main/devclean
-[Environment]::SetEnvironmentVariable(
-  'Path', "$env:Path;$HOME\bin", 'User')
-python $HOME\bin\devclean.py --dry-run
-```
-
-Then check it resolves:
+Verify:
 
 ```sh
 command -v devclean && devclean --dry-run
 ```
 
-`--dry-run` scans and prints the plan without touching anything, which is the
-right way to see what it would do on your machine before letting it do it.
+### Linux
+
+Most distributions ship Python 3. `~/.local/bin` is the XDG convention and is
+already on `PATH` on Debian, Ubuntu, Fedora and Arch, so the PATH line is
+usually unnecessary — check with `echo $PATH` before adding it.
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/devclean \
+  https://raw.githubusercontent.com/toufiqism/devclean/main/devclean
+chmod +x ~/.local/bin/devclean
+
+# only if ~/.local/bin is not already on PATH
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+exec bash
+```
+
+Verify:
+
+```sh
+command -v devclean && devclean --dry-run
+```
+
+### Windows
+
+Install Python 3 from [python.org](https://www.python.org/downloads/) or the
+Microsoft Store first, then in **PowerShell**:
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\devclean"
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+curl.exe -fsSL -o "$dir\devclean.py" `
+  https://raw.githubusercontent.com/toufiqism/devclean/main/devclean
+
+# Windows has no shebang, so a tiny shim makes `devclean` work as a command
+Set-Content "$dir\devclean.cmd" '@py "%~dp0devclean.py" %*'
+
+# add to PATH for future sessions
+$user = [Environment]::GetEnvironmentVariable('Path', 'User')
+[Environment]::SetEnvironmentVariable('Path', "$user;$dir", 'User')
+$env:Path += ";$dir"
+```
+
+Verify:
+
+```powershell
+devclean --dry-run
+```
+
+The shim calls `py`, the launcher the python.org installer sets up. If your
+install doesn't have it, swap `py` for `python` in that `Set-Content` line.
+
+Use **Windows Terminal** or PowerShell 7 if you can. The tool asks the console
+to enable ANSI colour and falls back to plain text when that's refused, but the
+legacy `cmd.exe` window also can't render the box-drawing characters in the
+disk bar, so it substitutes ASCII.
+
+### From a clone
+
+Preferable if you want the history, or intend to pull updates:
+
+```sh
+git clone https://github.com/toufiqism/devclean.git
+cd devclean
+install -m 755 devclean ~/bin/devclean       # macOS
+install -m 755 devclean ~/.local/bin/devclean # Linux
+```
+
+### First run
+
+`--dry-run` scans and prints the plan without touching anything. It's the right
+way to see what the tool would do on your machine before letting it do it:
+
+```sh
+devclean --dry-run
+```
 
 ### Updating
+
+From a clone:
 
 ```sh
 cd devclean && git pull && install -m 755 devclean ~/bin/devclean
 ```
 
+Standalone — rerun the same `curl` from your platform's section; it overwrites
+in place.
+
 ### Uninstalling
 
 ```sh
-rm ~/bin/devclean
+rm ~/bin/devclean            # macOS
+rm ~/.local/bin/devclean     # Linux
 ```
 
-It writes no config and no state. The only thing it may leave behind is
-`~/Desktop/devclean-quarantine/`, if it ever moved a file there for you.
+```powershell
+Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\devclean"
+```
+
+It writes no config and keeps no state, so nothing else is left behind — except
+`Desktop/devclean-quarantine/`, if it ever moved a file there for you.
 
 ## Usage
 
