@@ -1,6 +1,6 @@
 # devclean
 
-Interactive disk cleanup for macOS developer machines.
+Interactive disk cleanup for developer machines. Runs on macOS, Linux and Windows.
 
 Dev tooling quietly eats hundreds of gigabytes — stale iOS simulator runtimes,
 Android NDK copies, Gradle caches, emulator snapshots, browser caches. `devclean`
@@ -59,11 +59,22 @@ less ~/bin/devclean
 ```
 
 If `~/bin` isn't on your `PATH` yet, add it to your shell profile — `~/.zprofile`
-or `~/.zshrc` for zsh, which is the default on macOS:
+for zsh (the macOS default), `~/.bashrc` for bash:
 
 ```sh
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zprofile
-exec zsh
+exec $SHELL
+```
+
+On Windows, put `devclean` anywhere on `PATH` and run it with `python`:
+
+```powershell
+mkdir $HOME\bin -Force
+curl.exe -fsSL -o $HOME\bin\devclean.py `
+  https://raw.githubusercontent.com/toufiqism/devclean/main/devclean
+[Environment]::SetEnvironmentVariable(
+  'Path', "$env:Path;$HOME\bin", 'User')
+python $HOME\bin\devclean.py --dry-run
 ```
 
 Then check it resolves:
@@ -117,7 +128,7 @@ touching anything, which makes it safe to run from a script or a cron job.
 | -------- | -------------------------------------------------------------------------- |
 | `SAFE`   | Pure cache. Regenerates on its own. Preselected.                            |
 | `REVIEW` | Real cost to lose — a re-download, or state you may want. Never preselected.|
-| `MOVE`   | Not a cache. Relocated to `~/Desktop/devclean-quarantine/`, never deleted.   |
+| `MOVE`   | Not a cache. Relocated to `Desktop/devclean-quarantine/`, never deleted.    |
 
 Nothing is removed until you review the plan and type `yes`.
 
@@ -132,8 +143,10 @@ emulator snapshots, superseded Android Studio / JetBrains config directories.
 **Browsers** — Chrome, Chrome Beta, Brave, Edge, Vivaldi, Firefox. Cache
 subdirectories only.
 
-**Caches** — `~/.cache`, `~/Library/Caches`, npm, Yarn, pnpm, pip, uv, Homebrew,
-CocoaPods, Carthage, Go, Cargo, Puppeteer, Electron, Playwright.
+**Caches** — the platform cache root, plus npm, Yarn, pip, uv, Go, Cargo, Maven,
+pub, Puppeteer, Electron, Playwright, and per-platform extras (Homebrew,
+CocoaPods and Carthage on macOS; Flatpak and thumbnails on Linux; NuGet and
+`%LOCALAPPDATA%\Temp` on Windows).
 
 **Junk** — JVM/Node crash dumps, diagnostic reports, simulator logs, Trash.
 
@@ -144,8 +157,9 @@ The interesting part of a cleanup tool is what it refuses to touch.
 - **Hard denylist.** Documents, Desktop, Development, Projects, `~/src`, `.ssh`,
   `.gnupg`, Keychains, Mail, Messages, iCloud Drive. Every path is checked by
   `guard()` immediately before removal, not just when the list was built.
-- **Rooted deletes.** A path must resolve inside `$HOME` or `/Library/Developer`.
-  Anything else is skipped even if a probe somehow produced it.
+- **Rooted deletes.** A path must resolve inside `$HOME`, or one of the
+  platform roots (`/Library/Developer` on macOS; a relocated `XDG_CACHE_HOME`
+  or `%LOCALAPPDATA%`). Anything else is skipped even if a probe produced it.
 - **Browser profiles are never deleted** — only known cache subdirectories
   *inside* them. Passwords, bookmarks, history, cookies, extensions and
   IndexedDB are unreachable by design. The browser must be quit first.
@@ -160,16 +174,33 @@ The interesting part of a cleanup tool is what it refuses to touch.
   version directories, the most recently modified one is never offered.
 - **Large non-cache files are moved, not deleted.** Anything over 200 MB found
   inside browser storage (`File System`, `IndexedDB`, `blob_storage`) is
-  quarantined to the Desktop so you can look at it first. This exists because a
+  quarantined to `Desktop/devclean-quarantine/` — or the home directory, on
+  systems without a Desktop — so you can look at it first. This exists because a
   3 GB file sitting in Chrome's sandbox turned out to be a two-hour video, not
   garbage.
-- **Permission errors degrade quietly.** Paths needing Full Disk Access are
-  skipped and reported as a `sudo` command you can run yourself; they never
-  abort the scan.
+- **Permission errors degrade quietly.** Paths needing elevation are skipped
+  and reported back as a `sudo` (or `Remove-Item`) command you can run
+  yourself; they never abort the scan.
 
 ## Requirements
 
-macOS, Python 3.9+. Both ship with the system or with Xcode Command Line Tools.
+Python 3.9+ and nothing else — no third-party packages.
+
+| Platform | Notes |
+| -------- | ----- |
+| macOS    | Python ships with the Xcode Command Line Tools. Full feature set, including Xcode and iOS simulator probes. |
+| Linux    | Uses the XDG base directories, honouring `XDG_CACHE_HOME` and friends. |
+| Windows  | Uses `%LOCALAPPDATA%` and `%APPDATA%`. Requires Windows 10 1511+ for coloured output; it degrades to plain text on older consoles. |
+
+Probes that don't apply to the host are skipped, so each platform only ever
+sees targets that exist on it. Xcode and the iOS simulator sections appear on
+macOS alone; the Recycle Bin is deliberately left alone on Windows, because it
+is not safe to manipulate as plain files.
+
+One deliberate asymmetry: macOS and Linux get a generic sweep of their cache
+root (`~/Library/Caches`, `~/.cache`), because both operating systems define
+one. Windows does not — `%LOCALAPPDATA%` mixes real application state in with
+caches — so on Windows only specifically named caches are ever offered.
 
 ## License
 

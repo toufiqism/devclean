@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-devclean - interactive disk cleanup for macOS developer machines.
+devclean - interactive disk cleanup for developer machines.
 
 Scans the usual dev-tooling space hogs (Xcode, iOS simulators, Android SDK,
-Gradle, Chromium browsers, assorted caches), shows what each one costs, and
-deletes only what you tick.
+Gradle, Chromium browsers, language package caches), shows what each one costs,
+and deletes only what you tick.
+
+Runs on macOS, Linux and Windows. Probes that don't apply to the host are
+skipped, so each platform only ever sees targets that exist on it.
 
 Safety rules baked in:
   * Never deletes source, Documents, Desktop, keychains, or SSH keys.
-  * Never deletes a Chrome profile - only cache subdirectories inside it.
+  * Never deletes a browser profile - only cache subdirectories inside it.
     Passwords, bookmarks, history, extensions and IndexedDB are off-limits.
   * Keeps the newest iOS simulator runtime.
-  * Keeps NDK versions pinned by a project's ndkVersion, plus the newest two.
+  * Keeps NDK versions pinned by a project, resolved through both an explicit
+    ndkVersion and Flutter's gradle_utils.dart default.
   * Keeps the JetBrains/Android Studio config directory currently in use.
   * Large non-cache files found inside browser storage are offered as a MOVE
     to a quarantine folder, never a delete.
@@ -31,51 +35,148 @@ import re
 import shutil
 import subprocess
 import sys
-import termios
 import threading
 import time
-import tty
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+IS_POSIX = not IS_WIN
+
+if IS_WIN:
+    import msvcrt
+else:
+    import termios
+    import tty
+
 HOME = Path.home()
-QUARANTINE_DIR = HOME / "Desktop" / "devclean-quarantine"
+
+
+# --------------------------------------------------------------------------
+# platform layout
+#
+# Every OS-specific path is resolved here so the discovery probes below can
+# stay declarative. Environment overrides win, because a developer who moved
+# their SDK or cache root means it.
+# --------------------------------------------------------------------------
+
+def _env_dir(name: str, default: Path) -> Path:
+    val = os.environ.get(name)
+    return Path(val) if val else default
+
+
+LOCALAPPDATA = _env_dir("LOCALAPPDATA", HOME / "AppData" / "Local")
+APPDATA = _env_dir("APPDATA", HOME / "AppData" / "Roaming")
+XDG_CACHE = _env_dir("XDG_CACHE_HOME", HOME / ".cache")
+XDG_CONFIG = _env_dir("XDG_CONFIG_HOME", HOME / ".config")
+XDG_DATA = _env_dir("XDG_DATA_HOME", HOME / ".local" / "share")
+
+if IS_MAC:
+    CACHE_ROOT = HOME / "Library" / "Caches"
+    CONFIG_ROOT = HOME / "Library" / "Application Support"
+    OS_NAME = "macOS"
+elif IS_WIN:
+    # Deliberately not LOCALAPPDATA: on Windows that directory holds real
+    # application state alongside caches, so there is no safe generic sweep.
+    CACHE_ROOT = None
+    CONFIG_ROOT = APPDATA
+    OS_NAME = "Windows"
+else:
+    CACHE_ROOT = XDG_CACHE
+    CONFIG_ROOT = XDG_CONFIG
+    OS_NAME = "Linux"
+
+
+def quarantine_dir() -> Path:
+    desktop = HOME / "Desktop"
+    return (desktop if desktop.is_dir() else HOME) / "devclean-quarantine"
+
+
+QUARANTINE_DIR = quarantine_dir()
 
 SAFE, REVIEW, MOVE = "SAFE", "REVIEW", "MOVE"
 
-C_RESET = "\033[0m"
-C_DIM = "\033[2m"
-C_BOLD = "\033[1m"
-C_GREEN = "\033[32m"
-C_YELLOW = "\033[33m"
-C_CYAN = "\033[36m"
-C_RED = "\033[31m"
-C_INV = "\033[7m"
+
+# --------------------------------------------------------------------------
+# terminal capabilities
+# --------------------------------------------------------------------------
+
+def _enable_ansi() -> bool:
+    """Turn on VT sequence processing; older Windows consoles need asking."""
+    if not IS_WIN:
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+ANSI = _enable_ansi()
+UNICODE = "utf" in (getattr(sys.stdout, "encoding", "") or "").lower()
+
+if ANSI:
+    C_RESET, C_DIM, C_BOLD = "\033[0m", "\033[2m", "\033[1m"
+    C_GREEN, C_YELLOW, C_CYAN, C_RED = "\033[32m", "\033[33m", "\033[36m", "\033[31m"
+    C_INV = "\033[7m"
+else:
+    C_RESET = C_DIM = C_BOLD = C_GREEN = C_YELLOW = C_CYAN = C_RED = C_INV = ""
 
 RISK_COLOR = {SAFE: C_GREEN, REVIEW: C_YELLOW, MOVE: C_CYAN}
 
+BAR_FULL = "█" if UNICODE else "#"
+BAR_EMPTY = "░" if UNICODE else "."
+KEYHINT = "↑↓ move" if UNICODE else "up/down move"
+
+
+# --------------------------------------------------------------------------
+# safety boundaries
+# --------------------------------------------------------------------------
+
 # Absolute no-go zones. Nothing under these is ever removed.
-DENY = [
-    HOME / "Documents",
-    HOME / "Desktop",
-    HOME / "Pictures",
-    HOME / "Movies",
-    HOME / "Music",
-    HOME / "Downloads",
-    HOME / "Development",
-    HOME / "Projects",
-    HOME / "src",
-    HOME / ".ssh",
-    HOME / ".gnupg",
-    HOME / "Library" / "Keychains",
-    HOME / "Library" / "Mobile Documents",
-    HOME / "Library" / "Messages",
-    HOME / "Library" / "Mail",
-]
+DENY = [HOME / n for n in (
+    "Documents", "Desktop", "Pictures", "Music", "Movies", "Videos",
+    "Downloads", "Development", "Projects", "src", "Dropbox", "OneDrive",
+    ".ssh", ".gnupg", ".aws", ".kube", ".password-store",
+)]
+DENY.append(XDG_CONFIG / "gcloud")
+
+if IS_MAC:
+    DENY += [
+        HOME / "Library" / "Keychains",
+        HOME / "Library" / "Mobile Documents",
+        HOME / "Library" / "Messages",
+        HOME / "Library" / "Mail",
+        HOME / "Library" / "Photos",
+        HOME / "Library" / "Application Support" / "MobileSync",
+    ]
+elif IS_WIN:
+    DENY += [
+        LOCALAPPDATA / "Microsoft" / "Credentials",
+        APPDATA / "Microsoft" / "Crypto",
+        APPDATA / "Microsoft" / "Protect",
+    ]
+else:
+    DENY += [XDG_DATA / "keyrings", HOME / ".local" / "share" / "keyrings"]
 
 # Deletion is only ever allowed beneath one of these roots.
-ALLOW_ROOTS = [HOME, Path("/Library/Developer")]
+ALLOW_ROOTS = [HOME]
+if IS_MAC:
+    ALLOW_ROOTS.append(Path("/Library/Developer"))
+for _root in (CACHE_ROOT, CONFIG_ROOT, XDG_DATA, LOCALAPPDATA, APPDATA):
+    # Honour relocated cache/config roots that live outside the home directory.
+    if _root and _root != HOME and HOME not in _root.parents:
+        ALLOW_ROOTS.append(_root)
 
 
 # --------------------------------------------------------------------------
@@ -85,34 +186,77 @@ ALLOW_ROOTS = [HOME, Path("/Library/Developer")]
 def human(n: int) -> str:
     if n <= 0:
         return "0 B"
+    val = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} TB"
+        if val < 1024 or unit == "TB":
+            return f"{val:.0f} {unit}" if unit in ("B", "KB") else f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.1f} TB"
 
 
 def run(cmd: list[str], timeout: int = 120) -> str:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout
+        kwargs = {}
+        if IS_WIN:
+            # Keep console windows from flashing up for each probe.
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, **kwargs)
+        return r.stdout or ""
     except Exception:
         return ""
 
 
+HAVE_DU = IS_POSIX and shutil.which("du") is not None
+
+
+def _walk_size(path: Path) -> int:
+    """Portable fallback for du: iterative scandir, skipping what we can't read."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return 0
+    if not path.is_dir() or path.is_symlink():
+        return st.st_size
+
+    total, stack = 0, [str(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
 def du_bytes(paths) -> int:
-    """Total on-disk size via du, which is far faster than walking in Python."""
-    real = [str(p) for p in paths if Path(p).exists()]
+    """Total on-disk size. Uses du where present; walks the tree otherwise."""
+    real = [p for p in paths if Path(p).exists()]
     if not real:
         return 0
-    total = 0
-    for i in range(0, len(real), 150):
-        out = run(["du", "-sk"] + real[i:i + 150], timeout=300)
-        for line in out.splitlines():
-            head = line.split("\t")[0].strip()
-            if head.isdigit():
-                total += int(head) * 1024
-    return total
+
+    if HAVE_DU:
+        total = 0
+        strs = [str(p) for p in real]
+        for i in range(0, len(strs), 150):
+            out = run(["du", "-sk"] + strs[i:i + 150], timeout=300)
+            for line in out.splitlines():
+                head = line.split("\t")[0].strip()
+                if head.isdigit():
+                    total += int(head) * 1024
+        if total:
+            return total
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return sum(ex.map(lambda p: _walk_size(Path(p)), real))
 
 
 def listdir(p: Path) -> list[Path]:
@@ -134,7 +278,7 @@ def guard(p: Path) -> bool:
         if not p.is_absolute() or not p.exists():
             return False
         rp = p.resolve()
-        if rp == HOME or rp == Path("/") or len(rp.parts) <= 2:
+        if rp == HOME or rp == rp.anchor or len(rp.parts) <= 2:
             return False
         for d in DENY:
             if rp == d or d in rp.parents:
@@ -145,12 +289,55 @@ def guard(p: Path) -> bool:
 
 
 def disk_free() -> tuple[int, int]:
-    st = os.statvfs("/System/Volumes/Data")
-    return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+    """(free, total) for the volume the home directory lives on."""
+    usage = shutil.disk_usage(str(HOME))
+    return usage.free, usage.total
 
 
 def version_key(s: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", s)[:4]) or (0,)
+
+
+# File signatures, so quarantined items can be described without shelling out
+# to file(1) - which does not exist on Windows.
+MAGIC = [
+    (0, b"\x1a\x45\xdf\xa3", "Matroska/WebM video"),
+    (4, b"ftyp", "MP4/MOV video"),
+    (0, b"RIFF", "RIFF media (AVI/WAV)"),
+    (0, b"\x89PNG", "PNG image"),
+    (0, b"\xff\xd8\xff", "JPEG image"),
+    (0, b"GIF8", "GIF image"),
+    (0, b"PK\x03\x04", "ZIP archive"),
+    (0, b"SQLite format 3", "SQLite database"),
+    (0, b"%PDF", "PDF document"),
+    (0, b"\x1f\x8b", "gzip archive"),
+    (0, b"OggS", "Ogg media"),
+    (0, b"fLaC", "FLAC audio"),
+    (0, b"ID3", "MP3 audio"),
+    (0, b"\x37\x7a\xbc\xaf", "7-Zip archive"),
+]
+
+
+def sniff(path: Path) -> str:
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        return "unreadable"
+    for offset, sig, label in MAGIC:
+        if head[offset:offset + len(sig)] == sig:
+            return label
+    return "binary data"
+
+
+def proc_running(names: list[str]) -> bool:
+    if IS_WIN:
+        out = run(["tasklist", "/FO", "CSV", "/NH"], timeout=30).lower()
+        return any(n.lower() in out for n in names)
+    for n in names:
+        if run(["pgrep", "-x", n], timeout=15).strip():
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -173,10 +360,13 @@ class Target:
 
 
 # --------------------------------------------------------------------------
-# discovery
+# discovery: Xcode and iOS simulators (macOS only)
 # --------------------------------------------------------------------------
 
 def discover_xcode() -> list[Target]:
+    if not IS_MAC:
+        return []
+
     g = "Xcode & Simulators"
     out: list[Target] = []
     dev = HOME / "Library" / "Developer"
@@ -212,10 +402,11 @@ def discover_xcode() -> list[Target]:
 
 
 def discover_simulators() -> list[Target]:
+    if not IS_MAC or not shutil.which("xcrun"):
+        return []
+
     g = "Xcode & Simulators"
     out: list[Target] = []
-    if not shutil.which("xcrun"):
-        return out
 
     # Installed runtimes - keep the newest, offer the rest.
     raw = run(["xcrun", "simctl", "runtime", "list", "-j"], timeout=60)
@@ -228,7 +419,6 @@ def discover_simulators() -> list[Target]:
             runtimes.append({
                 "id": uid,
                 "version": str(info.get("version", "?")),
-                "build": str(info.get("build", "?")),
                 "size": int(info.get("sizeBytes") or 0),
                 "name": info.get("name") or f"iOS {info.get('version', '?')}",
             })
@@ -245,7 +435,6 @@ def discover_simulators() -> list[Target]:
             t.size = r["size"]
             out.append(t)
 
-    # Simulator devices.
     devs = run(["xcrun", "simctl", "list", "devices", "-j"], timeout=60)
     count = 0
     try:
@@ -257,8 +446,7 @@ def discover_simulators() -> list[Target]:
     if count and devdir.is_dir():
         out.append(Target("simdevices", g, f"All {count} simulator devices",
                           "Xcode recreates defaults; wipes installed apps and their data",
-                          REVIEW, runner=_devices_deleter(),
-                          paths=[devdir]))
+                          REVIEW, runner=_devices_deleter(), paths=[devdir]))
 
     dyld = Path("/Library/Developer/CoreSimulator/Caches/dyld")
     if dyld.is_dir():
@@ -287,10 +475,44 @@ def _devices_deleter():
     return go
 
 
+# --------------------------------------------------------------------------
+# discovery: Android
+# --------------------------------------------------------------------------
+
+def android_sdk() -> Path | None:
+    for env in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        val = os.environ.get(env)
+        if val and Path(val).is_dir():
+            return Path(val)
+    if IS_MAC:
+        cands = [HOME / "Library" / "Android" / "sdk"]
+    elif IS_WIN:
+        cands = [LOCALAPPDATA / "Android" / "Sdk"]
+    else:
+        cands = [HOME / "Android" / "Sdk", HOME / "Android" / "sdk"]
+    return next((c for c in cands if c.is_dir()), None)
+
+
+def gradle_home() -> Path:
+    return _env_dir("GRADLE_USER_HOME", HOME / ".gradle")
+
+
+def ide_config_roots() -> list[Path]:
+    if IS_MAC:
+        base = HOME / "Library" / "Application Support"
+        return [base / "Google", base / "JetBrains"]
+    if IS_WIN:
+        return [APPDATA / "Google", APPDATA / "JetBrains"]
+    return [XDG_CONFIG / "Google", XDG_CONFIG / "JetBrains"]
+
+
+PROJECT_ROOTS = ("Development", "Projects", "src", "dev",
+                 "AndroidStudioProjects", "StudioProjects", "IdeaProjects")
+
 # Vendored SDK trees pin NDK versions for their own CI, not for your builds.
-VENDOR_MARKERS = ("flutter-sdk", "/flutter/dev/", "/flutter/examples/",
-                  "/flutter/packages/", "integration_tests", "/.pub-cache/",
-                  "/node_modules/", "/AppData/")
+VENDOR_MARKERS = ("flutter-sdk", "flutter/dev", "flutter/examples",
+                  "flutter/packages", "integration_tests", ".pub-cache",
+                  "node_modules", "AppData")
 
 
 def flutter_default_ndk() -> set[str]:
@@ -301,19 +523,54 @@ def flutter_default_ndk() -> set[str]:
         roots.append(Path(exe).resolve().parent.parent)
     roots += [HOME / "Development" / "flutter-sdk" / "flutter",
               HOME / "flutter", HOME / "development" / "flutter",
-              HOME / "fvm" / "default"]
+              HOME / "fvm" / "default", LOCALAPPDATA / "flutter"]
     for r in roots:
         gu = (r / "packages" / "flutter_tools" / "lib" / "src" / "android"
               / "gradle_utils.dart")
         try:
             if gu.is_file():
-                m = re.search(r"ndkVersion\s*=\s*[\'\"]([\d.]+)[\'\"]",
+                m = re.search(r"ndkVersion\s*=\s*['\"]([\d.]+)['\"]",
                               gu.read_text(errors="ignore"))
                 if m:
                     return {m.group(1)}
         except OSError:
             continue
     return set()
+
+
+def _gradle_files() -> list[Path]:
+    """Locate project Gradle files without shelling out to find(1)."""
+    roots = [HOME / n for n in PROJECT_ROOTS]
+    roots = [r for r in roots if r.is_dir()]
+    if not roots:
+        return []
+
+    prune = {"node_modules", "build", ".git", "Pods", ".dart_tool", ".gradle",
+             "DerivedData", "Carthage", ".idea", "venv", ".venv"}
+    wanted = {"build.gradle", "build.gradle.kts",
+              "local.properties", "gradle.properties"}
+
+    found: list[Path] = []
+    for root in roots:
+        stack = [(root, 0)]
+        while stack and len(found) < 600:
+            d, depth = stack.pop()
+            if depth > 6:
+                continue
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name not in prune:
+                                    stack.append((Path(entry.path), depth + 1))
+                            elif entry.name in wanted:
+                                found.append(Path(entry.path))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return found
 
 
 def pinned_ndk_versions() -> set[str]:
@@ -328,39 +585,23 @@ def pinned_ndk_versions() -> set[str]:
     pin versions for Flutter's CI that no local app builds against, and
     counting those hides the versions that genuinely matter.
     """
-    roots = [p for p in (HOME / "Development", HOME / "Projects", HOME / "src",
-                         HOME / "dev", HOME / "AndroidStudioProjects",
-                         HOME / "StudioProjects") if p.is_dir()]
-    if not roots:
-        return set()
-
-    prune = ("node_modules", "build", ".git", "Pods", ".dart_tool", ".gradle",
-             "DerivedData", "Carthage")
-    cmd = ["find"] + [str(r) for r in roots] + ["-maxdepth", "7", "("]
-    for i, name in enumerate(prune):
-        if i:
-            cmd.append("-o")
-        cmd += ["-name", name]
-    cmd += [")", "-prune", "-o", "-type", "f", "("]
-    for i, name in enumerate(("build.gradle", "build.gradle.kts",
-                              "local.properties", "gradle.properties")):
-        if i:
-            cmd.append("-o")
-        cmd += ["-name", name]
-    cmd += [")", "-print"]
-
-    files = [f for f in run(cmd, timeout=60).splitlines()
-             if f and not any(m in f for m in VENDOR_MARKERS)][:600]
+    files = [f for f in _gradle_files()
+             if not any(m in f.as_posix() for m in VENDOR_MARKERS)]
     if not files:
         return set()
 
-    text = ""
-    for i in range(0, len(files), 200):
-        text += run(["grep", "-hoE", r"ndk(Version|\.dir).{0,45}"] + files[i:i + 200],
-                    timeout=45)
+    text = []
+    for f in files:
+        try:
+            text.append(f.read_text(errors="ignore"))
+        except OSError:
+            continue
+    blob = "\n".join(text)
 
-    pins = set(re.findall(r"\d+\.\d+\.\d{5,}", text))
-    if "flutter.ndkVersion" in text:
+    pins = set()
+    for m in re.finditer(r"ndk(?:Version|\.dir)[^\n]{0,60}", blob):
+        pins |= set(re.findall(r"\d+\.\d+\.\d{5,}", m.group(0)))
+    if "flutter.ndkVersion" in blob:
         pins |= flutter_default_ndk()
     return pins
 
@@ -368,48 +609,55 @@ def pinned_ndk_versions() -> set[str]:
 def discover_android() -> list[Target]:
     g = "Android"
     out: list[Target] = []
-    sdk = HOME / "Library" / "Android" / "sdk"
+    sdk = android_sdk()
 
-    ndk_root = sdk / "ndk"
-    if ndk_root.is_dir():
-        versions = sorted([d for d in listdir(ndk_root) if d.is_dir()],
-                          key=lambda d: version_key(d.name), reverse=True)
-        pinned = pinned_ndk_versions()
-        keep = {d.name for d in versions[:2]} | (pinned & {d.name for d in versions})
-        stale = [d for d in versions if d.name not in keep]
-        for d in stale:
-            out.append(Target(f"ndk_{d.name}", g, f"NDK {d.name}",
-                              "Re-installable via SDK Manager; not pinned by any project",
-                              REVIEW, [d]))
-        kept_pins = sorted(pinned & {d.name for d in versions})
-        if kept_pins:
-            out.append(Target("_ndk_note", g,
-                              "[kept: NDK pinned by your projects: "
-                              + ", ".join(kept_pins) + "]",
-                              "", SAFE, blocked="informational"))
-        missing = sorted(pinned - {d.name for d in versions})
-        if missing:
-            out.append(Target("_ndk_missing", g,
-                              "[MISSING: projects pin NDK "
-                              + ", ".join(missing) + " but it is not installed]",
-                              "", SAFE, blocked="informational"))
+    if sdk:
+        ndk_root = sdk / "ndk"
+        if ndk_root.is_dir():
+            versions = sorted([d for d in listdir(ndk_root) if d.is_dir()],
+                              key=lambda d: version_key(d.name), reverse=True)
+            installed = {d.name for d in versions}
+            pinned = pinned_ndk_versions()
+            keep = {d.name for d in versions[:2]} | (pinned & installed)
+            for d in versions:
+                if d.name not in keep:
+                    out.append(Target(f"ndk_{d.name}", g, f"NDK {d.name}",
+                                      "Re-installable via SDK Manager; not pinned by any project",
+                                      REVIEW, [d]))
+            kept_pins = sorted(pinned & installed)
+            if kept_pins:
+                out.append(Target("_ndk_note", g,
+                                  "[kept: NDK pinned by your projects: "
+                                  + ", ".join(kept_pins) + "]",
+                                  "", SAFE, blocked="informational"))
+            missing = sorted(pinned - installed)
+            if missing:
+                out.append(Target("_ndk_missing", g,
+                                  "[MISSING: projects pin NDK "
+                                  + ", ".join(missing) + " but it is not installed]",
+                                  "", SAFE, blocked="informational"))
 
-    gr = HOME / ".gradle"
+        for sub in ("system-images", "sources", "emulator/snapshots"):
+            p = sdk / sub
+            if p.is_dir() and has_content(p):
+                risk = SAFE if "snapshots" in sub else REVIEW
+                out.append(Target(f"sdk_{sub}", g, f"Android SDK {sub}",
+                                  "Re-installable via SDK Manager", risk, [p]))
+
+    gr = gradle_home()
     if (gr / "caches").is_dir():
         out.append(Target("gradle_caches", g, "Gradle caches",
                           "Dependencies re-download on next build (slow first build)",
                           REVIEW, [gr / "caches"]))
-    for sub, risk, why in (("daemon", SAFE, "Daemon logs"),
-                           ("native", SAFE, "Regenerated automatically"),
-                           ("kotlin-profile", SAFE, "Profiling scratch data")):
+    for sub, why in (("daemon", "Daemon logs"),
+                     ("native", "Regenerated automatically"),
+                     ("kotlin-profile", "Profiling scratch data")):
         p = gr / sub
         if p.is_dir():
             out.append(Target(f"gradle_{sub}", g, f"Gradle {sub}", why, SAFE, [p]))
 
     # JetBrains / Android Studio configs - keep the one most recently touched.
-    appsup = HOME / "Library" / "Application Support" / "Google"
-    jb = HOME / "Library" / "Application Support" / "JetBrains"
-    for base, prefix in ((appsup, "AndroidStudio"), (jb, "")):
+    for base in ide_config_roots():
         if not base.is_dir():
             continue
         groups: dict[str, list[Path]] = {}
@@ -417,28 +665,24 @@ def discover_android() -> list[Target]:
             if not d.is_dir():
                 continue
             m = re.match(r"([A-Za-z]+)[\d.]+$", d.name)
-            if m and (not prefix or d.name.startswith(prefix)):
+            if m:
                 groups.setdefault(m.group(1), []).append(d)
         for fam, dirs in groups.items():
             if len(dirs) < 2:
                 continue
-            dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            try:
+                dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            except OSError:
+                continue
             active = dirs[0]
             for d in dirs[1:]:
                 out.append(Target(f"ide_{d.name}", g, f"Stale {fam} config: {d.name}",
                                   f"Superseded; active install is {active.name}",
                                   REVIEW, [d]))
 
-    for sub in ("system-images", "sources", "emulator/snapshots"):
-        p = sdk / sub
-        if p.is_dir() and has_content(p):
-            risk = SAFE if "snapshots" in sub else REVIEW
-            out.append(Target(f"sdk_{sub}", g, f"Android SDK {sub}",
-                              "Re-installable via SDK Manager", risk, [p]))
-
-    avd = HOME / ".android" / "avd"
-    if avd.is_dir():
-        snaps = list(avd.glob("*/snapshots"))
+    avd_root = _env_dir("ANDROID_AVD_HOME", HOME / ".android" / "avd")
+    if avd_root.is_dir():
+        snaps = [p for p in avd_root.glob("*/snapshots") if p.is_dir()]
         if snaps:
             out.append(Target("avd_snap", g, "Emulator snapshots",
                               "Cold-boot state; emulators still work without them",
@@ -446,14 +690,40 @@ def discover_android() -> list[Target]:
     return out
 
 
-# Chromium-family browsers, keyed by their Application Support directory.
-CHROMIUM = {
-    "Chrome": "Google/Chrome",
-    "Chrome Beta": "Google/Chrome Beta",
-    "Brave": "BraveSoftware/Brave-Browser",
-    "Edge": "Microsoft Edge",
-    "Vivaldi": "Vivaldi",
-}
+# --------------------------------------------------------------------------
+# discovery: browsers
+# --------------------------------------------------------------------------
+
+def chromium_browsers() -> dict[str, tuple[Path, list[str]]]:
+    """name -> (user-data root, process names to check before touching it)."""
+    if IS_MAC:
+        b = HOME / "Library" / "Application Support"
+        return {
+            "Chrome": (b / "Google" / "Chrome", ["Google Chrome"]),
+            "Chrome Beta": (b / "Google" / "Chrome Beta", ["Google Chrome Beta"]),
+            "Chromium": (b / "Chromium", ["Chromium"]),
+            "Brave": (b / "BraveSoftware" / "Brave-Browser", ["Brave Browser"]),
+            "Edge": (b / "Microsoft Edge", ["Microsoft Edge"]),
+            "Vivaldi": (b / "Vivaldi", ["Vivaldi"]),
+        }
+    if IS_WIN:
+        L = LOCALAPPDATA
+        return {
+            "Chrome": (L / "Google" / "Chrome" / "User Data", ["chrome.exe"]),
+            "Chromium": (L / "Chromium" / "User Data", ["chromium.exe"]),
+            "Brave": (L / "BraveSoftware" / "Brave-Browser" / "User Data", ["brave.exe"]),
+            "Edge": (L / "Microsoft" / "Edge" / "User Data", ["msedge.exe"]),
+            "Vivaldi": (L / "Vivaldi" / "User Data", ["vivaldi.exe"]),
+        }
+    c = XDG_CONFIG
+    return {
+        "Chrome": (c / "google-chrome", ["chrome", "google-chrome"]),
+        "Chromium": (c / "chromium", ["chromium", "chromium-browser"]),
+        "Brave": (c / "BraveSoftware" / "Brave-Browser", ["brave"]),
+        "Edge": (c / "microsoft-edge", ["msedge"]),
+        "Vivaldi": (c / "vivaldi", ["vivaldi-bin", "vivaldi"]),
+    }
+
 
 # Cache subdirectories inside a profile. Everything not listed here is left alone.
 PROFILE_CACHES = [
@@ -471,24 +741,17 @@ TOP_CACHES = [
 ]
 
 # Storage areas that may accumulate stranded large files.
-STORAGE_AREAS = ["File System", "IndexedDB", "blob_storage", "Local Storage"]
-
-
-def _proc_running(name: str) -> bool:
-    return bool(run(["pgrep", "-x", name]).strip())
+STORAGE_AREAS = ["File System", "IndexedDB", "blob_storage"]
 
 
 def discover_browsers() -> list[Target]:
     g = "Browser"
     out: list[Target] = []
-    base = HOME / "Library" / "Application Support"
 
-    for pretty, rel in CHROMIUM.items():
-        root = base / rel
+    for pretty, (root, procs) in chromium_browsers().items():
         if not root.is_dir():
             continue
-        running = _proc_running(pretty) or _proc_running(f"Google {pretty}")
-        block = f"quit {pretty} first" if running else ""
+        block = f"quit {pretty} first" if proc_running(procs) else ""
 
         cache_paths, profiles = [], []
         for d in listdir(root):
@@ -515,41 +778,78 @@ def discover_browsers() -> list[Target]:
                 a = prof / area
                 if not a.is_dir():
                     continue
-                try:
-                    files = list(a.rglob("*"))
-                except OSError:
-                    continue
-                for f in files:
+                for f in _big_files(a, 200 * 1024 * 1024):
+                    kind = sniff(f)
+                    t = Target(f"q_{abs(hash(str(f)))}", g,
+                               f"Stranded file in {pretty} {area}",
+                               f"{kind} - moved out, not deleted",
+                               MOVE, [f], blocked=block)
                     try:
-                        if f.is_file() and not f.is_symlink() and f.stat().st_size > 200 * 1024 * 1024:
-                            kind = run(["file", "-b", str(f)])[:60].strip() or "unknown"
-                            t = Target(f"q_{abs(hash(str(f)))}", g,
-                                       f"Stranded file in {pretty} {area}",
-                                       f"{kind} - moved to Desktop, not deleted",
-                                       MOVE, [f], blocked=block)
-                            t.size = f.stat().st_size
-                            t.runner = _quarantine(f, kind)
-                            out.append(t)
+                        t.size = f.stat().st_size
                     except OSError:
                         continue
+                    t.runner = _quarantine(f, kind)
+                    out.append(t)
 
-        cache_root = HOME / "Library" / "Caches" / rel
-        if cache_root.is_dir():
+    # Chromium HTTP caches live outside the profile on macOS and Linux.
+    if IS_MAC:
+        http = {"Chrome": HOME / "Library" / "Caches" / "Google" / "Chrome",
+                "Brave": HOME / "Library" / "Caches" / "BraveSoftware",
+                "Edge": HOME / "Library" / "Caches" / "Microsoft Edge"}
+    elif IS_LINUX:
+        http = {"Chrome": XDG_CACHE / "google-chrome",
+                "Chromium": XDG_CACHE / "chromium",
+                "Brave": XDG_CACHE / "BraveSoftware",
+                "Edge": XDG_CACHE / "microsoft-edge"}
+    else:
+        http = {}
+    for pretty, p in http.items():
+        if p.is_dir():
             out.append(Target(f"brc_{pretty}", g, f"{pretty} HTTP cache",
-                              "Re-fetched as you browse", SAFE, [cache_root],
-                              blocked=block))
+                              "Re-fetched as you browse", SAFE, [p]))
 
-    ff = HOME / "Library" / "Caches" / "Firefox"
+    # Firefox keeps its cache outside the profile on every platform.
+    if IS_MAC:
+        ff = HOME / "Library" / "Caches" / "Firefox"
+    elif IS_WIN:
+        ff = LOCALAPPDATA / "Mozilla" / "Firefox" / "Profiles"
+    else:
+        ff = XDG_CACHE / "mozilla" / "firefox"
     if ff.is_dir():
+        procs = ["firefox.exe"] if IS_WIN else ["firefox"]
         out.append(Target("br_ff", g, "Firefox cache", "Re-fetched as you browse",
-                          SAFE, [ff], blocked="quit Firefox first" if _proc_running("firefox") else ""))
+                          SAFE, [ff],
+                          blocked="quit Firefox first" if proc_running(procs) else ""))
     return out
+
+
+def _big_files(root: Path, min_size: int, max_depth: int = 5) -> list[Path]:
+    found, stack = [], [(root, 0)]
+    while stack:
+        d, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append((Path(entry.path), depth + 1))
+                        elif (entry.is_file(follow_symlinks=False)
+                              and entry.stat(follow_symlinks=False).st_size > min_size):
+                            found.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return found
 
 
 def _quarantine(src: Path, kind: str):
     def go() -> str:
         QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
-        ext = ".mkv" if "Matroska" in kind else (".mp4" if "MP4" in kind else ".bin")
+        ext = {"Matroska/WebM video": ".mkv", "MP4/MOV video": ".mp4",
+               "ZIP archive": ".zip", "PDF document": ".pdf"}.get(kind, ".bin")
         stamp = time.strftime("%Y%m%d", time.localtime(src.stat().st_mtime))
         dest = QUARANTINE_DIR / f"{src.parent.parent.name}-{stamp}-{src.name}{ext}"
         n = 1
@@ -561,81 +861,128 @@ def _quarantine(src: Path, kind: str):
     return go
 
 
+# --------------------------------------------------------------------------
+# discovery: language and tool caches
+# --------------------------------------------------------------------------
+
+def _cache_candidates() -> list[tuple[str, Path, str]]:
+    """(key, path, why) for named tool caches, resolved per platform."""
+    c: list[tuple[str, Path, str]] = [
+        ("cargo", HOME / ".cargo" / "registry" / "cache", "Cargo registry cache"),
+        ("maven", HOME / ".m2" / "repository", "Maven local repository"),
+        ("pub", HOME / ".pub-cache", "Dart/Flutter package cache"),
+    ]
+    if IS_WIN:
+        c += [
+            ("npm", APPDATA / "npm-cache", "npm package cache"),
+            ("yarn", LOCALAPPDATA / "Yarn" / "Cache", "Yarn package cache"),
+            ("pip", LOCALAPPDATA / "pip" / "Cache", "pip wheel cache"),
+            ("uv", LOCALAPPDATA / "uv" / "cache", "uv package cache"),
+            ("go", LOCALAPPDATA / "go-build", "Go build cache"),
+            ("nuget", HOME / ".nuget" / "packages", "NuGet package cache"),
+            ("playwright", LOCALAPPDATA / "ms-playwright", "Playwright browsers"),
+            ("puppeteer", LOCALAPPDATA / "puppeteer", "Downloaded Chromium builds"),
+            ("temp", LOCALAPPDATA / "Temp", "User temp directory"),
+            ("crashdumps", LOCALAPPDATA / "CrashDumps", "Application crash dumps"),
+        ]
+    else:
+        npm = HOME / ".npm" / "_cacache"
+        c.append(("npm", npm, "npm package cache"))
+        if IS_MAC:
+            L = HOME / "Library" / "Caches"
+            c += [
+                ("yarn", L / "Yarn", "Yarn package cache"),
+                ("pip", L / "pip", "pip wheel cache"),
+                ("uv", L / "uv", "uv package cache"),
+                ("go", L / "go-build", "Go build cache"),
+                ("brew", L / "Homebrew", "Downloaded bottles"),
+                ("pods", L / "CocoaPods", "CocoaPods cache"),
+                ("carthage", L / "org.carthage.CarthageKit", "Carthage cache"),
+                ("playwright", L / "ms-playwright", "Playwright browsers"),
+                ("electron", L / "electron", "Electron downloads"),
+            ]
+        else:
+            c += [
+                ("yarn", XDG_CACHE / "yarn", "Yarn package cache"),
+                ("pip", XDG_CACHE / "pip", "pip wheel cache"),
+                ("uv", XDG_CACHE / "uv", "uv package cache"),
+                ("go", XDG_CACHE / "go-build", "Go build cache"),
+                ("playwright", XDG_CACHE / "ms-playwright", "Playwright browsers"),
+                ("electron", XDG_CACHE / "electron", "Electron downloads"),
+                ("thumbnails", XDG_CACHE / "thumbnails", "Thumbnail cache"),
+                ("jetbrains", XDG_CACHE / "JetBrains", "JetBrains IDE caches"),
+                ("flatpak", HOME / ".var" / "app", "Flatpak per-app caches"),
+            ]
+        c.append(("puppeteer", XDG_CACHE / "puppeteer", "Downloaded Chromium builds"))
+    return c
+
+
 def discover_caches() -> list[Target]:
     g = "Caches"
     out: list[Target] = []
+    seen: set[Path] = set()
 
-    dotcache = HOME / ".cache"
-    if dotcache.is_dir():
-        # vscode-ripgrep holds a real binary; leave it.
-        kids = [d for d in listdir(dotcache) if d.name != "vscode-ripgrep"]
+    for key, p, why in _cache_candidates():
+        if p.is_dir() and has_content(p) and p not in seen:
+            seen.add(p)
+            risk = REVIEW if key in ("maven", "nuget", "pub") else SAFE
+            out.append(Target(f"c_{key}", g, p.name, why, risk, [p]))
+
+    # A generic sweep is only safe where the OS defines a real cache root.
+    # Windows has none - LOCALAPPDATA mixes caches with application state.
+    if CACHE_ROOT and CACHE_ROOT.is_dir():
+        skip = {"vscode-ripgrep"} | {p.name for p in seen}
+        skip |= {"Firefox", "mozilla", "google-chrome", "chromium",
+                 "BraveSoftware", "Microsoft Edge", "microsoft-edge", "Google"}
+        kids = [d for d in listdir(CACHE_ROOT)
+                if d.is_dir() and d.name not in skip and d not in seen]
         if kids:
-            out.append(Target("dotcache", g, "~/.cache",
-                              f"{len(kids)} tool cache(s); each regenerates on demand",
+            label = "~/Library/Caches" if IS_MAC else "~/.cache"
+            out.append(Target("cacheroot", g, f"{label} (app caches)",
+                              f"{len(kids)} cache dir(s); apps rebuild them",
                               SAFE, kids))
-
-    named = [
-        ("npm", HOME / ".npm" / "_cacache", "npm package cache"),
-        ("yarn", HOME / "Library" / "Caches" / "Yarn", "Yarn package cache"),
-        ("pnpm", HOME / "Library" / "pnpm" / "store", "pnpm content store"),
-        ("pip", HOME / "Library" / "Caches" / "pip", "pip wheel cache"),
-        ("uv", HOME / "Library" / "Caches" / "uv", "uv package cache"),
-        ("brew", HOME / "Library" / "Caches" / "Homebrew", "Downloaded bottles"),
-        ("pods", HOME / "Library" / "Caches" / "CocoaPods", "CocoaPods cache"),
-        ("carthage", HOME / "Library" / "Caches" / "org.carthage.CarthageKit", "Carthage cache"),
-        ("go", HOME / "Library" / "Caches" / "go-build", "Go build cache"),
-        ("cargo", HOME / ".cargo" / "registry" / "cache", "Cargo registry cache"),
-        ("puppeteer", HOME / ".cache" / "puppeteer", "Downloaded Chromium builds"),
-        ("electron", HOME / "Library" / "Caches" / "electron", "Electron downloads"),
-        ("ms_playwright", HOME / "Library" / "Caches" / "ms-playwright", "Playwright browsers"),
-    ]
-    for key, p, why in named:
-        if p.is_dir() and has_content(p):
-            out.append(Target(f"c_{key}", g, p.name if key != "npm" else "npm cache",
-                              why, SAFE, [p]))
-
-    lib = HOME / "Library" / "Caches"
-    if lib.is_dir():
-        skip = {"Homebrew", "Yarn", "pip", "uv", "CocoaPods", "go-build", "electron",
-                "ms-playwright", "org.carthage.CarthageKit", "Firefox"}
-        skip |= {r.split("/")[0] for r in CHROMIUM.values()}
-        big = []
-        for d in listdir(lib):
-            if d.is_dir() and d.name not in skip:
-                big.append(d)
-        if big:
-            out.append(Target("libcaches", g, "~/Library/Caches (app caches)",
-                              f"{len(big)} app cache dir(s); apps rebuild them",
-                              SAFE, big))
     return out
 
+
+# --------------------------------------------------------------------------
+# discovery: junk
+# --------------------------------------------------------------------------
 
 def discover_junk() -> list[Target]:
     g = "Junk"
     out: list[Target] = []
 
-    dumps = list(HOME.glob("*.hprof")) + list(HOME.glob("*.heapsnapshot")) \
-        + list(HOME.glob("hs_err_pid*.log")) + list(HOME.glob("core.*"))
+    dumps = (list(HOME.glob("*.hprof")) + list(HOME.glob("*.heapsnapshot"))
+             + list(HOME.glob("hs_err_pid*.log")) + list(HOME.glob("core.*")))
     if dumps:
         out.append(Target("dumps", g, f"Crash/heap dumps in home ({len(dumps)})",
                           "JVM and Node crash artifacts", SAFE, dumps))
 
-    trash = HOME / ".Trash"
-    if trash.is_dir() and has_content(trash):
-        out.append(Target("trash", g, "Trash", "Empties the Trash", REVIEW,
-                          listdir(trash)))
+    if IS_MAC:
+        trash = [HOME / ".Trash"]
+        logs = [(HOME / "Library" / "Logs" / "DiagnosticReports", "Crash reports"),
+                (HOME / "Library" / "Logs" / "CoreSimulator", "Simulator logs"),
+                (HOME / "Library" / "Application Support" / "CrashReporter",
+                 "Crash reporter data"),
+                (HOME / "Library" / "Developer" / "Xcode" / "iOS Device Logs",
+                 "Device crash logs")]
+    elif IS_LINUX:
+        trash = [XDG_DATA / "Trash"]
+        logs = [(XDG_CACHE / "xsession-errors", "Session error log"),
+                (HOME / ".local" / "share" / "sddm", "Display manager logs")]
+    else:
+        trash = []  # Recycle Bin is not safe to manipulate as plain files.
+        logs = []
 
-    for rel, why in (("Library/Logs/DiagnosticReports", "Crash reports"),
-                     ("Library/Logs/CoreSimulator", "Simulator logs"),
-                     ("Library/Application Support/CrashReporter", "Crash reporter data")):
-        p = HOME / rel
+    for t in trash:
+        if t.is_dir() and has_content(t):
+            out.append(Target("trash", g, "Trash", "Empties the Trash", REVIEW,
+                              listdir(t)))
+
+    for p, why in logs:
         if p.is_dir() and has_content(p):
-            out.append(Target(f"log_{p.name}", g, f"{p.name}", why, SAFE, listdir(p)))
+            out.append(Target(f"log_{p.name}", g, p.name, why, SAFE, listdir(p)))
 
-    ios_logs = HOME / "Library" / "Developer" / "Xcode" / "iOS Device Logs"
-    if ios_logs.is_dir() and has_content(ios_logs):
-        out.append(Target("ioslogs", g, "iOS device logs", "Device crash logs", SAFE,
-                          [ios_logs]))
     return out
 
 
@@ -645,6 +992,7 @@ def discover_junk() -> list[Target]:
 
 def scan(safe_only: bool) -> list[Target]:
     spinner_stop = threading.Event()
+    interactive = sys.stdout.isatty()
 
     def spin():
         frames = "|/-\\"
@@ -657,7 +1005,6 @@ def scan(safe_only: bool) -> list[Target]:
         sys.stdout.write("\r" + " " * 40 + "\r")
         sys.stdout.flush()
 
-    interactive = sys.stdout.isatty()
     th = threading.Thread(target=spin, daemon=True)
     if interactive:
         th.start()
@@ -703,25 +1050,49 @@ def scan(safe_only: bool) -> list[Target]:
 # --------------------------------------------------------------------------
 
 class Keyboard:
+    """Single-keypress reader. Raw mode on POSIX, msvcrt on Windows."""
+
     def __enter__(self):
-        self.fd = sys.stdin.fileno()
-        self.old = termios.tcgetattr(self.fd)
-        tty.setraw(self.fd)
+        if IS_POSIX:
+            self.fd = sys.stdin.fileno()
+            self.old = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd)
         return self
 
     def __exit__(self, *a):
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        if IS_POSIX:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
     def key(self) -> str:
+        if IS_WIN:
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):        # extended key prefix
+                code = msvcrt.getwch()
+                return {"H": "up", "P": "down",
+                        "M": "right", "K": "left"}.get(code, "esc")
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch == "\x03":
+                return "quit"
+            if ch == "\x1b":
+                return "esc"
+            return ch.lower()
+
         ch = sys.stdin.read(1)
         if ch == "\x1b":
             nxt = sys.stdin.read(2)
-            return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(nxt, "esc")
+            return {"[A": "up", "[B": "down",
+                    "[C": "right", "[D": "left"}.get(nxt, "esc")
         if ch in ("\r", "\n"):
             return "enter"
         if ch == "\x03":
             return "quit"
         return ch.lower()
+
+
+def _line(text: str) -> None:
+    """Rows need an explicit CR on POSIX raw mode; Windows cooks it for us."""
+    print(text + ("" if IS_WIN else "\r"))
 
 
 def render(targets: list[Target], cursor: int, top: int, rows: int) -> None:
@@ -733,64 +1104,62 @@ def render(targets: list[Target], cursor: int, top: int, rows: int) -> None:
 
     bar_w = 28
     filled = int(bar_w * pct / 100)
-    bar = "█" * filled + "░" * (bar_w - filled)
+    bar = BAR_FULL * filled + BAR_EMPTY * (bar_w - filled)
     colr = C_RED if pct > 85 else (C_YELLOW if pct > 70 else C_GREEN)
 
-    sys.stdout.write("\033[H\033[J")
-    print(f"{C_BOLD}  devclean{C_RESET}  {C_DIM}interactive disk cleanup{C_RESET}\r")
-    print(f"  {colr}{bar}{C_RESET} {human(used)} used / {human(total)}  "
-          f"{C_BOLD}{human(free)} free{C_RESET} ({pct:.0f}%)\r")
-    print(f"  selected: {C_BOLD}{len(sel)}{C_RESET} item(s)  "
+    sys.stdout.write("\033[H\033[J" if ANSI else "\n" * 3)
+    _line(f"{C_BOLD}  devclean{C_RESET}  {C_DIM}interactive disk cleanup "
+          f"· {OS_NAME}{C_RESET}" if UNICODE else
+          f"{C_BOLD}  devclean{C_RESET}  {C_DIM}interactive disk cleanup"
+          f" - {OS_NAME}{C_RESET}")
+    _line(f"  {colr}{bar}{C_RESET} {human(used)} used / {human(total)}  "
+          f"{C_BOLD}{human(free)} free{C_RESET} ({pct:.0f}%)")
+    _line(f"  selected: {C_BOLD}{len(sel)}{C_RESET} item(s)  "
           f"reclaims {C_GREEN}{C_BOLD}{human(gain)}{C_RESET}  "
-          f"-> {human(free + gain)} free\r")
-    print(f"  {C_DIM}{'-' * 74}{C_RESET}\r")
+          f"-> {human(free + gain)} free")
+    _line(f"  {C_DIM}{'-' * 74}{C_RESET}")
 
     group = None
-    shown = targets[top:top + rows]
-    for i, t in enumerate(shown, start=top):
+    for i, t in enumerate(targets[top:top + rows], start=top):
         if t.group != group:
             group = t.group
-            print(f"  {C_BOLD}{group}{C_RESET}\r")
+            _line(f"  {C_BOLD}{group}{C_RESET}")
+        if t.blocked == "informational":
+            _line(f"    {C_DIM}{t.label}{C_RESET}")
+            continue
         mark = "x" if t.selected and not t.blocked else " "
         col = RISK_COLOR.get(t.risk, "")
         cur = C_INV if i == cursor else ""
         size = human(t.size).rjust(9)
-
-        if t.blocked == "informational":
-            print(f"    {C_DIM}{t.label}{C_RESET}\r")
-            continue
-        tag = f"{col}{t.risk:<6}{C_RESET}"
-        line = f"  {cur}[{mark}]{C_RESET} {size}  {tag} {t.label}"
-        print(line + "\r")
+        _line(f"  {cur}[{mark}]{C_RESET} {size}  {col}{t.risk:<6}{C_RESET} {t.label}")
         if i == cursor:
             note = t.blocked or t.detail
             style = C_RED if t.blocked else C_DIM
-            print(f"          {style}{note}{C_RESET}\r")
+            _line(f"          {style}{note}{C_RESET}")
             if t.note:
-                print(f"          {C_YELLOW}({t.note}){C_RESET}\r")
+                _line(f"          {C_YELLOW}({t.note}){C_RESET}")
 
-    print(f"  {C_DIM}{'-' * 74}{C_RESET}\r")
-    print(f"  {C_DIM}↑↓ move   space toggle   a all-safe   n none   "
-          f"v invert   enter clean   q quit{C_RESET}\r")
+    _line(f"  {C_DIM}{'-' * 74}{C_RESET}")
+    _line(f"  {C_DIM}{KEYHINT}   space toggle   a all-safe   n none   "
+          f"v invert   enter clean   q quit{C_RESET}")
 
 
 def choose(targets: list[Target]) -> bool:
-    live = [t for t in targets if t.blocked != "informational"]
-    if not live:
+    if not [t for t in targets if t.blocked != "informational"]:
         print("Nothing worth cleaning. Disk looks tidy.")
         return False
 
     cursor, top = 0, 0
-    rows = max(8, (shutil.get_terminal_size((80, 30)).lines) - 14)
+    rows = max(8, shutil.get_terminal_size((80, 30)).lines - 14)
 
     with Keyboard() as kb:
         while True:
-            visible = [i for i, t in enumerate(targets)]
             render(targets, cursor, top, rows)
             k = kb.key()
 
             if k in ("q", "quit", "esc"):
-                sys.stdout.write("\033[H\033[J")
+                if ANSI:
+                    sys.stdout.write("\033[H\033[J")
                 return False
             if k == "up":
                 cursor = max(0, cursor - 1)
@@ -798,7 +1167,8 @@ def choose(targets: list[Target]) -> bool:
                     cursor -= 1
             elif k == "down":
                 cursor = min(len(targets) - 1, cursor + 1)
-                while cursor < len(targets) - 1 and targets[cursor].blocked == "informational":
+                while (cursor < len(targets) - 1
+                       and targets[cursor].blocked == "informational"):
                     cursor += 1
             elif k == " ":
                 t = targets[cursor]
@@ -813,10 +1183,11 @@ def choose(targets: list[Target]) -> bool:
                     t.selected = False
             elif k == "v":
                 for t in targets:
-                    if not t.blocked and t.blocked != "informational":
+                    if not t.blocked:
                         t.selected = not t.selected
             elif k == "enter":
-                sys.stdout.write("\033[H\033[J")
+                if ANSI:
+                    sys.stdout.write("\033[H\033[J")
                 return True
 
             if cursor < top:
@@ -856,14 +1227,13 @@ def execute(targets: list[Target], dry: bool) -> None:
         return
 
     before, _ = disk_free()
-    sudo_needed: list[str] = []
+    elevated: list[str] = []
     print()
 
     for t in sel:
         try:
             if t.runner:
-                msg = t.runner()
-                print(f"  {C_GREEN}ok{C_RESET}  {t.label} - {msg}")
+                print(f"  {C_GREEN}ok{C_RESET}  {t.label} - {t.runner()}")
                 continue
 
             removed, skipped = 0, 0
@@ -873,12 +1243,12 @@ def execute(targets: list[Target], dry: bool) -> None:
                     continue
                 try:
                     if p.is_dir() and not p.is_symlink():
-                        shutil.rmtree(p, ignore_errors=False)
+                        shutil.rmtree(p)
                     else:
                         p.unlink()
                     removed += 1
                 except PermissionError:
-                    sudo_needed.append(str(p))
+                    elevated.append(str(p))
                     skipped += 1
                 except OSError:
                     skipped += 1
@@ -890,34 +1260,31 @@ def execute(targets: list[Target], dry: bool) -> None:
             print(f"  {C_RED}!!{C_RESET}  {t.label}: {e}")
 
     time.sleep(2)
-    after, total_disk = disk_free()
-    gained = after - before
+    after, _ = disk_free()
 
     print(f"\n{C_BOLD}Done.{C_RESET}")
     print(f"  free: {human(before)} -> {C_BOLD}{human(after)}{C_RESET}  "
-          f"({C_GREEN}+{human(max(0, gained))}{C_RESET})")
-    if any(t.runner and "runtime" in t.key for t in sel):
+          f"({C_GREEN}+{human(max(0, after - before))}{C_RESET})")
+    if any(t.runner and t.key.startswith("rt_") for t in sel):
         print(f"  {C_DIM}Simulator runtime deletion runs in the background; "
               f"more space frees up shortly.{C_RESET}")
     if QUARANTINE_DIR.exists():
         print(f"  {C_CYAN}Quarantined files -> {QUARANTINE_DIR}{C_RESET}")
-    if sudo_needed:
-        print(f"\n  {C_YELLOW}Needs elevated permission. Run this yourself:{C_RESET}")
-        joined = " ".join(f'"{p}"' for p in sudo_needed[:6])
-        print(f"    sudo rm -rf {joined}")
+    if elevated:
+        print(f"\n  {C_YELLOW}Needs elevated permission. Remove these yourself:{C_RESET}")
+        joined = " ".join(f'"{p}"' for p in elevated[:6])
+        print("    " + (f"Remove-Item -Recurse -Force {joined}" if IS_WIN
+                        else f"sudo rm -rf {joined}"))
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Interactive disk cleanup for macOS dev machines.")
+    ap = argparse.ArgumentParser(
+        description="Interactive disk cleanup for developer machines.")
     ap.add_argument("--dry-run", action="store_true", help="show the plan, change nothing")
     ap.add_argument("--safe-only", action="store_true", help="only offer SAFE items")
     args = ap.parse_args()
 
-    if sys.platform != "darwin":
-        print("devclean targets macOS.")
-        return 1
-
-    print(f"\n{C_BOLD}devclean{C_RESET}")
+    print(f"\n{C_BOLD}devclean{C_RESET} {C_DIM}({OS_NAME}){C_RESET}")
     targets = scan(args.safe_only)
     if not targets:
         print("Nothing worth cleaning.")
