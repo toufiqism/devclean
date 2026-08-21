@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""
+devclean - interactive disk cleanup for macOS developer machines.
+
+Scans the usual dev-tooling space hogs (Xcode, iOS simulators, Android SDK,
+Gradle, Chromium browsers, assorted caches), shows what each one costs, and
+deletes only what you tick.
+
+Safety rules baked in:
+  * Never deletes source, Documents, Desktop, keychains, or SSH keys.
+  * Never deletes a Chrome profile - only cache subdirectories inside it.
+    Passwords, bookmarks, history, extensions and IndexedDB are off-limits.
+  * Keeps the newest iOS simulator runtime.
+  * Keeps NDK versions pinned by a project's ndkVersion, plus the newest two.
+  * Keeps the JetBrains/Android Studio config directory currently in use.
+  * Large non-cache files found inside browser storage are offered as a MOVE
+    to a quarantine folder, never a delete.
+
+Usage:
+  devclean              interactive
+  devclean --dry-run    show the plan, change nothing
+  devclean --safe-only  skip anything not classified SAFE
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+HOME = Path.home()
+QUARANTINE_DIR = HOME / "Desktop" / "devclean-quarantine"
+
+SAFE, REVIEW, MOVE = "SAFE", "REVIEW", "MOVE"
+
+C_RESET = "\033[0m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_CYAN = "\033[36m"
+C_RED = "\033[31m"
+C_INV = "\033[7m"
+
+RISK_COLOR = {SAFE: C_GREEN, REVIEW: C_YELLOW, MOVE: C_CYAN}
+
+# Absolute no-go zones. Nothing under these is ever removed.
+DENY = [
+    HOME / "Documents",
+    HOME / "Desktop",
+    HOME / "Pictures",
+    HOME / "Movies",
+    HOME / "Music",
+    HOME / "Downloads",
+    HOME / "Development",
+    HOME / "Projects",
+    HOME / "src",
+    HOME / ".ssh",
+    HOME / ".gnupg",
+    HOME / "Library" / "Keychains",
+    HOME / "Library" / "Mobile Documents",
+    HOME / "Library" / "Messages",
+    HOME / "Library" / "Mail",
+]
+
+# Deletion is only ever allowed beneath one of these roots.
+ALLOW_ROOTS = [HOME, Path("/Library/Developer")]
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def human(n: int) -> str:
+    if n <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TB"
+
+
+def run(cmd: list[str], timeout: int = 120) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def du_bytes(paths) -> int:
+    """Total on-disk size via du, which is far faster than walking in Python."""
+    real = [str(p) for p in paths if Path(p).exists()]
+    if not real:
+        return 0
+    total = 0
+    for i in range(0, len(real), 150):
+        out = run(["du", "-sk"] + real[i:i + 150], timeout=300)
+        for line in out.splitlines():
+            head = line.split("\t")[0].strip()
+            if head.isdigit():
+                total += int(head) * 1024
+    return total
+
+
+def listdir(p: Path) -> list[Path]:
+    """iterdir() that yields [] instead of raising on protected dirs."""
+    try:
+        return list(p.iterdir())
+    except OSError:
+        return []
+
+
+def has_content(p: Path) -> bool:
+    return bool(listdir(p))
+
+
+def guard(p: Path) -> bool:
+    """True only if p is safe to delete."""
+    try:
+        p = Path(p).expanduser()
+        if not p.is_absolute() or not p.exists():
+            return False
+        rp = p.resolve()
+        if rp == HOME or rp == Path("/") or len(rp.parts) <= 2:
+            return False
+        for d in DENY:
+            if rp == d or d in rp.parents:
+                return False
+        return any(r == rp or r in rp.parents for r in ALLOW_ROOTS)
+    except OSError:
+        return False
+
+
+def disk_free() -> tuple[int, int]:
+    st = os.statvfs("/System/Volumes/Data")
+    return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+
+
+def version_key(s: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", s)[:4]) or (0,)
+
+
+# --------------------------------------------------------------------------
+# target model
+# --------------------------------------------------------------------------
+
+@dataclass
+class Target:
+    key: str
+    group: str
+    label: str
+    detail: str
+    risk: str
+    paths: list[Path] = field(default_factory=list)
+    runner: object = None          # callable() -> str, for non-path actions
+    size: int = 0
+    note: str = ""
+    selected: bool = False
+    blocked: str = ""              # non-empty means it cannot run right now
+
+
+# --------------------------------------------------------------------------
+# discovery
+# --------------------------------------------------------------------------
+
+def discover_xcode() -> list[Target]:
+    g = "Xcode & Simulators"
+    out: list[Target] = []
+    dev = HOME / "Library" / "Developer"
+
+    dd = dev / "Xcode" / "DerivedData"
+    if dd.is_dir() and has_content(dd):
+        out.append(Target("derived", g, "Xcode DerivedData",
+                          "Build intermediates; rebuilt on next build",
+                          SAFE, [dd]))
+
+    ds = dev / "Xcode" / "iOS DeviceSupport"
+    if ds.is_dir():
+        kids = sorted(listdir(ds))
+        if kids:
+            out.append(Target("devsupport", g, "iOS DeviceSupport",
+                              f"{len(kids)} device(s); re-created when you replug",
+                              SAFE, kids))
+
+    for name, risk, why in (
+        ("Archives", REVIEW, "Shipped-build archives - needed to symbolicate crash reports"),
+        ("Products", SAFE, "Build products"),
+        ("CodingAssistant", REVIEW, "Xcode assistant data - may include chat history"),
+    ):
+        p = dev / "Xcode" / name
+        if p.is_dir() and has_content(p):
+            out.append(Target(f"xc_{name}", g, f"Xcode {name}", why, risk, [p]))
+
+    tmp = dev / "CoreSimulator" / "Temp"
+    if tmp.is_dir() and has_content(tmp):
+        out.append(Target("simtemp", g, "Simulator temp files", "Scratch data", SAFE, [tmp]))
+
+    return out
+
+
+def discover_simulators() -> list[Target]:
+    g = "Xcode & Simulators"
+    out: list[Target] = []
+    if not shutil.which("xcrun"):
+        return out
+
+    # Installed runtimes - keep the newest, offer the rest.
+    raw = run(["xcrun", "simctl", "runtime", "list", "-j"], timeout=60)
+    runtimes = []
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+        for uid, info in (data.items() if isinstance(data, dict) else []):
+            if not isinstance(info, dict):
+                continue
+            runtimes.append({
+                "id": uid,
+                "version": str(info.get("version", "?")),
+                "build": str(info.get("build", "?")),
+                "size": int(info.get("sizeBytes") or 0),
+                "name": info.get("name") or f"iOS {info.get('version', '?')}",
+            })
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    if len(runtimes) > 1:
+        runtimes.sort(key=lambda r: version_key(r["version"]), reverse=True)
+        newest = runtimes[0]
+        for r in runtimes[1:]:
+            t = Target(f"rt_{r['id']}", g, f"Simulator runtime {r['name']}",
+                       f"Re-downloadable in Xcode; keeping {newest['name']}",
+                       REVIEW, runner=_runtime_deleter(r["id"]))
+            t.size = r["size"]
+            out.append(t)
+
+    # Simulator devices.
+    devs = run(["xcrun", "simctl", "list", "devices", "-j"], timeout=60)
+    count = 0
+    try:
+        for _rt, lst in (json.loads(devs).get("devices", {}) or {}).items():
+            count += len(lst)
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        pass
+    devdir = HOME / "Library" / "Developer" / "CoreSimulator" / "Devices"
+    if count and devdir.is_dir():
+        out.append(Target("simdevices", g, f"All {count} simulator devices",
+                          "Xcode recreates defaults; wipes installed apps and their data",
+                          REVIEW, runner=_devices_deleter(),
+                          paths=[devdir]))
+
+    dyld = Path("/Library/Developer/CoreSimulator/Caches/dyld")
+    if dyld.is_dir():
+        t = Target("dyld", g, "Simulator dyld cache",
+                   "Rebuilt on next simulator boot (first boot is slower)",
+                   SAFE, [dyld])
+        t.note = "needs sudo"
+        out.append(t)
+
+    return out
+
+
+def _runtime_deleter(uid: str):
+    def go() -> str:
+        subprocess.run(["xcrun", "simctl", "runtime", "delete", uid],
+                       capture_output=True, timeout=120)
+        return "deletion queued (runs in background)"
+    return go
+
+
+def _devices_deleter():
+    def go() -> str:
+        subprocess.run(["xcrun", "simctl", "delete", "all"],
+                       capture_output=True, timeout=300)
+        return "deleted"
+    return go
+
+
+# Vendored SDK trees pin NDK versions for their own CI, not for your builds.
+VENDOR_MARKERS = ("flutter-sdk", "/flutter/dev/", "/flutter/examples/",
+                  "/flutter/packages/", "integration_tests", "/.pub-cache/",
+                  "/node_modules/", "/AppData/")
+
+
+def flutter_default_ndk() -> set[str]:
+    """The NDK version `ndkVersion = flutter.ndkVersion` resolves to."""
+    roots = []
+    exe = shutil.which("flutter")
+    if exe:
+        roots.append(Path(exe).resolve().parent.parent)
+    roots += [HOME / "Development" / "flutter-sdk" / "flutter",
+              HOME / "flutter", HOME / "development" / "flutter",
+              HOME / "fvm" / "default"]
+    for r in roots:
+        gu = (r / "packages" / "flutter_tools" / "lib" / "src" / "android"
+              / "gradle_utils.dart")
+        try:
+            if gu.is_file():
+                m = re.search(r"ndkVersion\s*=\s*[\'\"]([\d.]+)[\'\"]",
+                              gu.read_text(errors="ignore"))
+                if m:
+                    return {m.group(1)}
+        except OSError:
+            continue
+    return set()
+
+
+def pinned_ndk_versions() -> set[str]:
+    """NDK versions your own projects actually build against.
+
+    Two ways a project pins one, and both must be honoured:
+      * an explicit `ndkVersion = "x.y.z"` in its Gradle files
+      * `ndkVersion = flutter.ndkVersion`, which resolves to the constant in
+        the Flutter SDK's gradle_utils.dart
+
+    Vendored SDK trees are excluded. The Flutter SDK's own integration tests
+    pin versions for Flutter's CI that no local app builds against, and
+    counting those hides the versions that genuinely matter.
+    """
+    roots = [p for p in (HOME / "Development", HOME / "Projects", HOME / "src",
+                         HOME / "dev", HOME / "AndroidStudioProjects",
+                         HOME / "StudioProjects") if p.is_dir()]
+    if not roots:
+        return set()
+
+    prune = ("node_modules", "build", ".git", "Pods", ".dart_tool", ".gradle",
+             "DerivedData", "Carthage")
+    cmd = ["find"] + [str(r) for r in roots] + ["-maxdepth", "7", "("]
+    for i, name in enumerate(prune):
+        if i:
+            cmd.append("-o")
+        cmd += ["-name", name]
+    cmd += [")", "-prune", "-o", "-type", "f", "("]
+    for i, name in enumerate(("build.gradle", "build.gradle.kts",
+                              "local.properties", "gradle.properties")):
+        if i:
+            cmd.append("-o")
+        cmd += ["-name", name]
+    cmd += [")", "-print"]
+
+    files = [f for f in run(cmd, timeout=60).splitlines()
+             if f and not any(m in f for m in VENDOR_MARKERS)][:600]
+    if not files:
+        return set()
+
+    text = ""
+    for i in range(0, len(files), 200):
+        text += run(["grep", "-hoE", r"ndk(Version|\.dir).{0,45}"] + files[i:i + 200],
+                    timeout=45)
+
+    pins = set(re.findall(r"\d+\.\d+\.\d{5,}", text))
+    if "flutter.ndkVersion" in text:
+        pins |= flutter_default_ndk()
+    return pins
+
+
+def discover_android() -> list[Target]:
+    g = "Android"
+    out: list[Target] = []
+    sdk = HOME / "Library" / "Android" / "sdk"
+
+    ndk_root = sdk / "ndk"
+    if ndk_root.is_dir():
+        versions = sorted([d for d in listdir(ndk_root) if d.is_dir()],
+                          key=lambda d: version_key(d.name), reverse=True)
+        pinned = pinned_ndk_versions()
+        keep = {d.name for d in versions[:2]} | (pinned & {d.name for d in versions})
+        stale = [d for d in versions if d.name not in keep]
+        for d in stale:
+            out.append(Target(f"ndk_{d.name}", g, f"NDK {d.name}",
+                              "Re-installable via SDK Manager; not pinned by any project",
+                              REVIEW, [d]))
+        kept_pins = sorted(pinned & {d.name for d in versions})
+        if kept_pins:
+            out.append(Target("_ndk_note", g,
+                              "[kept: NDK pinned by your projects: "
+                              + ", ".join(kept_pins) + "]",
+                              "", SAFE, blocked="informational"))
+        missing = sorted(pinned - {d.name for d in versions})
+        if missing:
+            out.append(Target("_ndk_missing", g,
+                              "[MISSING: projects pin NDK "
+                              + ", ".join(missing) + " but it is not installed]",
+                              "", SAFE, blocked="informational"))
+
+    gr = HOME / ".gradle"
+    if (gr / "caches").is_dir():
+        out.append(Target("gradle_caches", g, "Gradle caches",
+                          "Dependencies re-download on next build (slow first build)",
+                          REVIEW, [gr / "caches"]))
+    for sub, risk, why in (("daemon", SAFE, "Daemon logs"),
+                           ("native", SAFE, "Regenerated automatically"),
+                           ("kotlin-profile", SAFE, "Profiling scratch data")):
+        p = gr / sub
+        if p.is_dir():
+            out.append(Target(f"gradle_{sub}", g, f"Gradle {sub}", why, SAFE, [p]))
+
+    # JetBrains / Android Studio configs - keep the one most recently touched.
+    appsup = HOME / "Library" / "Application Support" / "Google"
+    jb = HOME / "Library" / "Application Support" / "JetBrains"
+    for base, prefix in ((appsup, "AndroidStudio"), (jb, "")):
+        if not base.is_dir():
+            continue
+        groups: dict[str, list[Path]] = {}
+        for d in listdir(base):
+            if not d.is_dir():
+                continue
+            m = re.match(r"([A-Za-z]+)[\d.]+$", d.name)
+            if m and (not prefix or d.name.startswith(prefix)):
+                groups.setdefault(m.group(1), []).append(d)
+        for fam, dirs in groups.items():
+            if len(dirs) < 2:
+                continue
+            dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            active = dirs[0]
+            for d in dirs[1:]:
+                out.append(Target(f"ide_{d.name}", g, f"Stale {fam} config: {d.name}",
+                                  f"Superseded; active install is {active.name}",
+                                  REVIEW, [d]))
+
+    for sub in ("system-images", "sources", "emulator/snapshots"):
+        p = sdk / sub
+        if p.is_dir() and has_content(p):
+            risk = SAFE if "snapshots" in sub else REVIEW
+            out.append(Target(f"sdk_{sub}", g, f"Android SDK {sub}",
+                              "Re-installable via SDK Manager", risk, [p]))
+
+    avd = HOME / ".android" / "avd"
+    if avd.is_dir():
+        snaps = list(avd.glob("*/snapshots"))
+        if snaps:
+            out.append(Target("avd_snap", g, "Emulator snapshots",
+                              "Cold-boot state; emulators still work without them",
+                              SAFE, snaps))
+    return out
+
+
+# Chromium-family browsers, keyed by their Application Support directory.
+CHROMIUM = {
+    "Chrome": "Google/Chrome",
+    "Chrome Beta": "Google/Chrome Beta",
+    "Brave": "BraveSoftware/Brave-Browser",
+    "Edge": "Microsoft Edge",
+    "Vivaldi": "Vivaldi",
+}
+
+# Cache subdirectories inside a profile. Everything not listed here is left alone.
+PROFILE_CACHES = [
+    "Service Worker/CacheStorage", "Service Worker/ScriptCache",
+    "GPUCache", "DawnWebGPUCache", "DawnGraphiteCache", "GrShaderCache",
+    "Shared Dictionary", "Code Cache", "Cache", "Media Cache",
+    "Application Cache", "ShaderCache",
+]
+
+TOP_CACHES = [
+    "extensions_crx_cache", "component_crx_cache", "BrowserMetrics",
+    "OptGuideOnDeviceClassifierModel", "optimization_guide_model_store",
+    "WasmTtsEngine", "ShaderCache", "GrShaderCache", "OnDeviceHeadSuggestModel",
+    "SwReporter", "CertificateRevocation",
+]
+
+# Storage areas that may accumulate stranded large files.
+STORAGE_AREAS = ["File System", "IndexedDB", "blob_storage", "Local Storage"]
+
+
+def _proc_running(name: str) -> bool:
+    return bool(run(["pgrep", "-x", name]).strip())
+
+
+def discover_browsers() -> list[Target]:
+    g = "Browser"
+    out: list[Target] = []
+    base = HOME / "Library" / "Application Support"
+
+    for pretty, rel in CHROMIUM.items():
+        root = base / rel
+        if not root.is_dir():
+            continue
+        running = _proc_running(pretty) or _proc_running(f"Google {pretty}")
+        block = f"quit {pretty} first" if running else ""
+
+        cache_paths, profiles = [], []
+        for d in listdir(root):
+            if d.is_dir() and (d.name == "Default" or d.name.startswith("Profile ")):
+                profiles.append(d)
+                for sub in PROFILE_CACHES:
+                    p = d / sub
+                    if p.exists():
+                        cache_paths.append(p)
+        for sub in TOP_CACHES:
+            p = root / sub
+            if p.exists():
+                cache_paths.append(p)
+
+        if cache_paths:
+            out.append(Target(f"br_{pretty}", g, f"{pretty} caches",
+                              f"{len(profiles)} profile(s). Passwords, bookmarks, "
+                              f"history, extensions and IndexedDB untouched",
+                              SAFE, cache_paths, blocked=block))
+
+        # Stranded large files inside browser storage -> quarantine, never delete.
+        for prof in profiles:
+            for area in STORAGE_AREAS:
+                a = prof / area
+                if not a.is_dir():
+                    continue
+                try:
+                    files = list(a.rglob("*"))
+                except OSError:
+                    continue
+                for f in files:
+                    try:
+                        if f.is_file() and not f.is_symlink() and f.stat().st_size > 200 * 1024 * 1024:
+                            kind = run(["file", "-b", str(f)])[:60].strip() or "unknown"
+                            t = Target(f"q_{abs(hash(str(f)))}", g,
+                                       f"Stranded file in {pretty} {area}",
+                                       f"{kind} - moved to Desktop, not deleted",
+                                       MOVE, [f], blocked=block)
+                            t.size = f.stat().st_size
+                            t.runner = _quarantine(f, kind)
+                            out.append(t)
+                    except OSError:
+                        continue
+
+        cache_root = HOME / "Library" / "Caches" / rel
+        if cache_root.is_dir():
+            out.append(Target(f"brc_{pretty}", g, f"{pretty} HTTP cache",
+                              "Re-fetched as you browse", SAFE, [cache_root],
+                              blocked=block))
+
+    ff = HOME / "Library" / "Caches" / "Firefox"
+    if ff.is_dir():
+        out.append(Target("br_ff", g, "Firefox cache", "Re-fetched as you browse",
+                          SAFE, [ff], blocked="quit Firefox first" if _proc_running("firefox") else ""))
+    return out
+
+
+def _quarantine(src: Path, kind: str):
+    def go() -> str:
+        QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+        ext = ".mkv" if "Matroska" in kind else (".mp4" if "MP4" in kind else ".bin")
+        stamp = time.strftime("%Y%m%d", time.localtime(src.stat().st_mtime))
+        dest = QUARANTINE_DIR / f"{src.parent.parent.name}-{stamp}-{src.name}{ext}"
+        n = 1
+        while dest.exists():
+            dest = dest.with_name(f"{dest.stem}-{n}{ext}")
+            n += 1
+        shutil.move(str(src), str(dest))
+        return f"moved to {dest}"
+    return go
+
+
+def discover_caches() -> list[Target]:
+    g = "Caches"
+    out: list[Target] = []
+
+    dotcache = HOME / ".cache"
+    if dotcache.is_dir():
+        # vscode-ripgrep holds a real binary; leave it.
+        kids = [d for d in listdir(dotcache) if d.name != "vscode-ripgrep"]
+        if kids:
+            out.append(Target("dotcache", g, "~/.cache",
+                              f"{len(kids)} tool cache(s); each regenerates on demand",
+                              SAFE, kids))
+
+    named = [
+        ("npm", HOME / ".npm" / "_cacache", "npm package cache"),
+        ("yarn", HOME / "Library" / "Caches" / "Yarn", "Yarn package cache"),
+        ("pnpm", HOME / "Library" / "pnpm" / "store", "pnpm content store"),
+        ("pip", HOME / "Library" / "Caches" / "pip", "pip wheel cache"),
+        ("uv", HOME / "Library" / "Caches" / "uv", "uv package cache"),
+        ("brew", HOME / "Library" / "Caches" / "Homebrew", "Downloaded bottles"),
+        ("pods", HOME / "Library" / "Caches" / "CocoaPods", "CocoaPods cache"),
+        ("carthage", HOME / "Library" / "Caches" / "org.carthage.CarthageKit", "Carthage cache"),
+        ("go", HOME / "Library" / "Caches" / "go-build", "Go build cache"),
+        ("cargo", HOME / ".cargo" / "registry" / "cache", "Cargo registry cache"),
+        ("puppeteer", HOME / ".cache" / "puppeteer", "Downloaded Chromium builds"),
+        ("electron", HOME / "Library" / "Caches" / "electron", "Electron downloads"),
+        ("ms_playwright", HOME / "Library" / "Caches" / "ms-playwright", "Playwright browsers"),
+    ]
+    for key, p, why in named:
+        if p.is_dir() and has_content(p):
+            out.append(Target(f"c_{key}", g, p.name if key != "npm" else "npm cache",
+                              why, SAFE, [p]))
+
+    lib = HOME / "Library" / "Caches"
+    if lib.is_dir():
+        skip = {"Homebrew", "Yarn", "pip", "uv", "CocoaPods", "go-build", "electron",
+                "ms-playwright", "org.carthage.CarthageKit", "Firefox"}
+        skip |= {r.split("/")[0] for r in CHROMIUM.values()}
+        big = []
+        for d in listdir(lib):
+            if d.is_dir() and d.name not in skip:
+                big.append(d)
+        if big:
+            out.append(Target("libcaches", g, "~/Library/Caches (app caches)",
+                              f"{len(big)} app cache dir(s); apps rebuild them",
+                              SAFE, big))
+    return out
+
+
+def discover_junk() -> list[Target]:
+    g = "Junk"
+    out: list[Target] = []
+
+    dumps = list(HOME.glob("*.hprof")) + list(HOME.glob("*.heapsnapshot")) \
+        + list(HOME.glob("hs_err_pid*.log")) + list(HOME.glob("core.*"))
+    if dumps:
+        out.append(Target("dumps", g, f"Crash/heap dumps in home ({len(dumps)})",
+                          "JVM and Node crash artifacts", SAFE, dumps))
+
+    trash = HOME / ".Trash"
+    if trash.is_dir() and has_content(trash):
+        out.append(Target("trash", g, "Trash", "Empties the Trash", REVIEW,
+                          listdir(trash)))
+
+    for rel, why in (("Library/Logs/DiagnosticReports", "Crash reports"),
+                     ("Library/Logs/CoreSimulator", "Simulator logs"),
+                     ("Library/Application Support/CrashReporter", "Crash reporter data")):
+        p = HOME / rel
+        if p.is_dir() and has_content(p):
+            out.append(Target(f"log_{p.name}", g, f"{p.name}", why, SAFE, listdir(p)))
+
+    ios_logs = HOME / "Library" / "Developer" / "Xcode" / "iOS Device Logs"
+    if ios_logs.is_dir() and has_content(ios_logs):
+        out.append(Target("ioslogs", g, "iOS device logs", "Device crash logs", SAFE,
+                          [ios_logs]))
+    return out
+
+
+# --------------------------------------------------------------------------
+# scan
+# --------------------------------------------------------------------------
+
+def scan(safe_only: bool) -> list[Target]:
+    spinner_stop = threading.Event()
+
+    def spin():
+        frames = "|/-\\"
+        i = 0
+        while not spinner_stop.is_set():
+            sys.stdout.write(f"\r  {frames[i % 4]} scanning disk...")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.12)
+        sys.stdout.write("\r" + " " * 40 + "\r")
+        sys.stdout.flush()
+
+    interactive = sys.stdout.isatty()
+    th = threading.Thread(target=spin, daemon=True)
+    if interactive:
+        th.start()
+
+    targets: list[Target] = []
+    try:
+        probes = (discover_xcode, discover_simulators, discover_android,
+                  discover_browsers, discover_caches, discover_junk)
+
+        def probe(fn):
+            try:
+                return fn()
+            except Exception as e:            # one bad probe must not kill the scan
+                print(f"\r  ! {fn.__name__}: {e}", file=sys.stderr)
+                return []
+
+        with ThreadPoolExecutor(max_workers=len(probes)) as ex:
+            for got in ex.map(probe, probes):
+                targets.extend(got)
+
+        need = [t for t in targets if t.paths and not t.size]
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for t, sz in zip(need, ex.map(lambda t: du_bytes(t.paths), need)):
+                t.size = sz
+    finally:
+        spinner_stop.set()
+        if interactive:
+            th.join(timeout=1)
+
+    targets = [t for t in targets
+               if t.size > 1024 * 1024 or t.blocked == "informational" or t.runner]
+    if safe_only:
+        targets = [t for t in targets if t.risk == SAFE]
+    order = {"Xcode & Simulators": 0, "Android": 1, "Browser": 2, "Caches": 3, "Junk": 4}
+    targets.sort(key=lambda t: (order.get(t.group, 9), -t.size))
+    for t in targets:
+        t.selected = t.risk == SAFE and not t.blocked
+    return targets
+
+
+# --------------------------------------------------------------------------
+# interactive UI
+# --------------------------------------------------------------------------
+
+class Keyboard:
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, *a):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def key(self) -> str:
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            nxt = sys.stdin.read(2)
+            return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(nxt, "esc")
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x03":
+            return "quit"
+        return ch.lower()
+
+
+def render(targets: list[Target], cursor: int, top: int, rows: int) -> None:
+    free, total = disk_free()
+    used = total - free
+    pct = used / total * 100 if total else 0
+    sel = [t for t in targets if t.selected and not t.blocked]
+    gain = sum(t.size for t in sel)
+
+    bar_w = 28
+    filled = int(bar_w * pct / 100)
+    bar = "█" * filled + "░" * (bar_w - filled)
+    colr = C_RED if pct > 85 else (C_YELLOW if pct > 70 else C_GREEN)
+
+    sys.stdout.write("\033[H\033[J")
+    print(f"{C_BOLD}  devclean{C_RESET}  {C_DIM}interactive disk cleanup{C_RESET}\r")
+    print(f"  {colr}{bar}{C_RESET} {human(used)} used / {human(total)}  "
+          f"{C_BOLD}{human(free)} free{C_RESET} ({pct:.0f}%)\r")
+    print(f"  selected: {C_BOLD}{len(sel)}{C_RESET} item(s)  "
+          f"reclaims {C_GREEN}{C_BOLD}{human(gain)}{C_RESET}  "
+          f"-> {human(free + gain)} free\r")
+    print(f"  {C_DIM}{'-' * 74}{C_RESET}\r")
+
+    group = None
+    shown = targets[top:top + rows]
+    for i, t in enumerate(shown, start=top):
+        if t.group != group:
+            group = t.group
+            print(f"  {C_BOLD}{group}{C_RESET}\r")
+        mark = "x" if t.selected and not t.blocked else " "
+        col = RISK_COLOR.get(t.risk, "")
+        cur = C_INV if i == cursor else ""
+        size = human(t.size).rjust(9)
+
+        if t.blocked == "informational":
+            print(f"    {C_DIM}{t.label}{C_RESET}\r")
+            continue
+        tag = f"{col}{t.risk:<6}{C_RESET}"
+        line = f"  {cur}[{mark}]{C_RESET} {size}  {tag} {t.label}"
+        print(line + "\r")
+        if i == cursor:
+            note = t.blocked or t.detail
+            style = C_RED if t.blocked else C_DIM
+            print(f"          {style}{note}{C_RESET}\r")
+            if t.note:
+                print(f"          {C_YELLOW}({t.note}){C_RESET}\r")
+
+    print(f"  {C_DIM}{'-' * 74}{C_RESET}\r")
+    print(f"  {C_DIM}↑↓ move   space toggle   a all-safe   n none   "
+          f"v invert   enter clean   q quit{C_RESET}\r")
+
+
+def choose(targets: list[Target]) -> bool:
+    live = [t for t in targets if t.blocked != "informational"]
+    if not live:
+        print("Nothing worth cleaning. Disk looks tidy.")
+        return False
+
+    cursor, top = 0, 0
+    rows = max(8, (shutil.get_terminal_size((80, 30)).lines) - 14)
+
+    with Keyboard() as kb:
+        while True:
+            visible = [i for i, t in enumerate(targets)]
+            render(targets, cursor, top, rows)
+            k = kb.key()
+
+            if k in ("q", "quit", "esc"):
+                sys.stdout.write("\033[H\033[J")
+                return False
+            if k == "up":
+                cursor = max(0, cursor - 1)
+                while cursor > 0 and targets[cursor].blocked == "informational":
+                    cursor -= 1
+            elif k == "down":
+                cursor = min(len(targets) - 1, cursor + 1)
+                while cursor < len(targets) - 1 and targets[cursor].blocked == "informational":
+                    cursor += 1
+            elif k == " ":
+                t = targets[cursor]
+                if not t.blocked:
+                    t.selected = not t.selected
+            elif k == "a":
+                for t in targets:
+                    if not t.blocked:
+                        t.selected = t.risk == SAFE
+            elif k == "n":
+                for t in targets:
+                    t.selected = False
+            elif k == "v":
+                for t in targets:
+                    if not t.blocked and t.blocked != "informational":
+                        t.selected = not t.selected
+            elif k == "enter":
+                sys.stdout.write("\033[H\033[J")
+                return True
+
+            if cursor < top:
+                top = cursor
+            elif cursor >= top + rows:
+                top = cursor - rows + 1
+
+
+# --------------------------------------------------------------------------
+# execute
+# --------------------------------------------------------------------------
+
+def execute(targets: list[Target], dry: bool) -> None:
+    sel = [t for t in targets if t.selected and not t.blocked]
+    if not sel:
+        print("Nothing selected.")
+        return
+
+    print(f"\n{C_BOLD}Plan{C_RESET}\n")
+    for t in sel:
+        verb = "MOVE" if t.risk == MOVE else "DELETE"
+        col = RISK_COLOR.get(t.risk, "")
+        print(f"  {col}{verb:<7}{C_RESET} {human(t.size).rjust(9)}  {t.label}")
+    total = sum(t.size for t in sel)
+    print(f"\n  reclaims about {C_BOLD}{C_GREEN}{human(total)}{C_RESET}\n")
+
+    if dry:
+        print(f"{C_DIM}--dry-run: nothing was changed.{C_RESET}")
+        return
+
+    try:
+        if input(f"Type {C_BOLD}yes{C_RESET} to proceed: ").strip().lower() != "yes":
+            print("Aborted. Nothing changed.")
+            return
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted. Nothing changed.")
+        return
+
+    before, _ = disk_free()
+    sudo_needed: list[str] = []
+    print()
+
+    for t in sel:
+        try:
+            if t.runner:
+                msg = t.runner()
+                print(f"  {C_GREEN}ok{C_RESET}  {t.label} - {msg}")
+                continue
+
+            removed, skipped = 0, 0
+            for p in t.paths:
+                if not guard(p):
+                    skipped += 1
+                    continue
+                try:
+                    if p.is_dir() and not p.is_symlink():
+                        shutil.rmtree(p, ignore_errors=False)
+                    else:
+                        p.unlink()
+                    removed += 1
+                except PermissionError:
+                    sudo_needed.append(str(p))
+                    skipped += 1
+                except OSError:
+                    skipped += 1
+
+            tail = f" ({skipped} skipped)" if skipped else ""
+            state = C_GREEN + "ok" + C_RESET if removed else C_YELLOW + "--" + C_RESET
+            print(f"  {state}  {t.label}{tail}")
+        except Exception as e:
+            print(f"  {C_RED}!!{C_RESET}  {t.label}: {e}")
+
+    time.sleep(2)
+    after, total_disk = disk_free()
+    gained = after - before
+
+    print(f"\n{C_BOLD}Done.{C_RESET}")
+    print(f"  free: {human(before)} -> {C_BOLD}{human(after)}{C_RESET}  "
+          f"({C_GREEN}+{human(max(0, gained))}{C_RESET})")
+    if any(t.runner and "runtime" in t.key for t in sel):
+        print(f"  {C_DIM}Simulator runtime deletion runs in the background; "
+              f"more space frees up shortly.{C_RESET}")
+    if QUARANTINE_DIR.exists():
+        print(f"  {C_CYAN}Quarantined files -> {QUARANTINE_DIR}{C_RESET}")
+    if sudo_needed:
+        print(f"\n  {C_YELLOW}Needs elevated permission. Run this yourself:{C_RESET}")
+        joined = " ".join(f'"{p}"' for p in sudo_needed[:6])
+        print(f"    sudo rm -rf {joined}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Interactive disk cleanup for macOS dev machines.")
+    ap.add_argument("--dry-run", action="store_true", help="show the plan, change nothing")
+    ap.add_argument("--safe-only", action="store_true", help="only offer SAFE items")
+    args = ap.parse_args()
+
+    if sys.platform != "darwin":
+        print("devclean targets macOS.")
+        return 1
+
+    print(f"\n{C_BOLD}devclean{C_RESET}")
+    targets = scan(args.safe_only)
+    if not targets:
+        print("Nothing worth cleaning.")
+        return 0
+
+    if not sys.stdin.isatty():
+        for t in targets:
+            print(f"{t.risk:<6} {human(t.size).rjust(9)}  {t.label}")
+        return 0
+
+    try:
+        if choose(targets):
+            execute(targets, args.dry_run)
+        else:
+            print("Cancelled. Nothing changed.")
+    except KeyboardInterrupt:
+        print("\nCancelled. Nothing changed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
