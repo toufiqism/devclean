@@ -32,16 +32,63 @@ Python 3 standard library only. No dependencies, no install step, one file.
 
 ## Install
 
-```sh
-git clone https://github.com/<you>/devclean.git
-install -m 755 devclean/devclean ~/bin/devclean   # anywhere on your PATH
-```
+It's a single file with no dependencies, so installing means putting it
+somewhere on your `PATH` and making it executable.
 
-If `~/bin` isn't on your PATH yet, add it to `~/.zprofile` (or `~/.zshrc`):
+**Clone the repo** — best if you want to read the source first or pull updates:
 
 ```sh
-export PATH="$HOME/bin:$PATH"
+git clone https://github.com/toufiqism/devclean.git
+install -m 755 devclean/devclean ~/bin/devclean
 ```
+
+**Or grab just the script:**
+
+```sh
+mkdir -p ~/bin
+curl -fsSL -o ~/bin/devclean \
+  https://raw.githubusercontent.com/toufiqism/devclean/main/devclean
+chmod +x ~/bin/devclean
+```
+
+Read it before you run it — it deletes things, and you should not take that on
+trust from a stranger's README:
+
+```sh
+less ~/bin/devclean
+```
+
+If `~/bin` isn't on your `PATH` yet, add it to your shell profile — `~/.zprofile`
+or `~/.zshrc` for zsh, which is the default on macOS:
+
+```sh
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zprofile
+exec zsh
+```
+
+Then check it resolves:
+
+```sh
+command -v devclean && devclean --dry-run
+```
+
+`--dry-run` scans and prints the plan without touching anything, which is the
+right way to see what it would do on your machine before letting it do it.
+
+### Updating
+
+```sh
+cd devclean && git pull && install -m 755 devclean ~/bin/devclean
+```
+
+### Uninstalling
+
+```sh
+rm ~/bin/devclean
+```
+
+It writes no config and no state. The only thing it may leave behind is
+`~/Desktop/devclean-quarantine/`, if it ever moved a file there for you.
 
 ## Usage
 
