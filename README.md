@@ -9,23 +9,24 @@ finds them, shows what each one costs, and deletes only what you tick.
 Python 3 standard library only. No dependencies, no install step, one file.
 
 ```
-  ████████████████░░░░░░░░░░░░ 130.6 GB used / 228.3 GB  97.6 GB free (57%)
-  selected: 6 item(s)  reclaims 7.3 GB  -> 104.9 GB free
+  █████████████████████░░░░░░░ 384.2 GB used / 500.0 GB  115.8 GB free (77%)
+  selected: 5 item(s)  reclaims 23.8 GB  -> 139.6 GB free
   --------------------------------------------------------------------------
   Xcode & Simulators
-  [x]    3.0 GB  SAFE   Simulator dyld cache
-  [ ]  412.2 MB  REVIEW Xcode CodingAssistant
+  [x]   11.4 GB  SAFE   Simulator dyld cache
+  [ ]    8.9 GB  REVIEW Simulator runtime iOS 18.4
+  [x]    6.2 GB  SAFE   iOS DeviceSupport
   Android
-  [x]    3.9 GB  SAFE   Emulator snapshots
-          Cold-boot state; emulators still work without them
-  [ ]    2.3 GB  REVIEW Android SDK system-images
-  [x]    2.2 MB  SAFE   Gradle native
-    [kept: NDK pinned by your projects: 28.2.13676358]
-    [MISSING: projects pin NDK 27.0.12077973 but it is not installed]
+  [ ]    3.1 GB  REVIEW NDK 25.2.9519653
+  [ ]    2.8 GB  REVIEW Gradle caches
+  [x]    1.9 GB  SAFE   Emulator snapshots
+    [kept: NDK pinned by your projects: 27.2.12479018]
   Browser
-  [x]   12.4 MB  SAFE   Chrome caches
+  [ ]    1.4 GB  MOVE   Stranded file in Chrome File System
+          Matroska/WebM video - moved out, not deleted
+  [x]  742.0 MB  SAFE   Chrome caches
   Caches
-  [x]  335.8 MB  SAFE   ~/Library/Caches (app caches)
+  [x]    3.6 GB  SAFE   ~/.cache (app caches)
   --------------------------------------------------------------------------
   ↑↓ move   space toggle   a all-safe   n none   v invert   enter clean   q quit
 ```
