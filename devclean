@@ -1272,9 +1272,25 @@ def execute(targets: list[Target], dry: bool) -> None:
         print(f"  {C_CYAN}Quarantined files -> {QUARANTINE_DIR}{C_RESET}")
     if elevated:
         print(f"\n  {C_YELLOW}Needs elevated permission. Remove these yourself:{C_RESET}")
-        joined = " ".join(f'"{p}"' for p in elevated[:6])
-        print("    " + (f"Remove-Item -Recurse -Force {joined}" if IS_WIN
-                        else f"sudo rm -rf {joined}"))
+        for line in elevated_command(elevated):
+            print("    " + line)
+
+
+def elevated_command(paths: list[str]) -> list[str]:
+    """Shell command, as lines, for paths the run could not delete itself.
+
+    PowerShell's Remove-Item binds only one bare string positionally, so
+    several quoted paths in a row fail with PositionalParameterNotFound.
+    Pass them as an array instead, and use -LiteralPath so a path holding
+    [ or ] is not read as a wildcard.
+    """
+    if not IS_WIN:
+        return ["sudo rm -rf " + " ".join(f'"{p}"' for p in paths)]
+    if len(paths) == 1:
+        return [f'Remove-Item -Recurse -Force -LiteralPath "{paths[0]}"']
+    return (["Remove-Item -Recurse -Force -LiteralPath @("]
+            + [f'    "{p}"' for p in paths]
+            + [")"])
 
 
 def main() -> int:
