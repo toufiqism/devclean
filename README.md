@@ -216,6 +216,11 @@ pub, Puppeteer, Electron, Playwright, and per-platform extras (Homebrew,
 CocoaPods and Carthage on macOS; Flatpak and thumbnails on Linux; NuGet and
 `%LOCALAPPDATA%\Temp` on Windows).
 
+**Stremio** — the streaming server's torrent cache (`stremio-cache`), at its
+default location for each platform and the Flatpak build, or wherever you moved
+it in Stremio's settings. Only the cache's contents go; `server-settings.json`
+and the app are left alone. Stremio must be quit first.
+
 **Junk** — JVM/Node crash dumps, diagnostic reports, simulator logs, Trash.
 
 ## Safety
@@ -228,6 +233,8 @@ The interesting part of a cleanup tool is what it refuses to touch.
 - **Rooted deletes.** A path must resolve inside `$HOME`, or one of the
   platform roots (`/Library/Developer` on macOS; a relocated `XDG_CACHE_HOME`
   or `%LOCALAPPDATA%`). Anything else is skipped even if a probe produced it.
+  The one addition is a Stremio cache moved to another drive: the `stremio-cache`
+  directory itself is allowed, never the drive or folder it was moved into.
 - **Browser profiles are never deleted** — only known cache subdirectories
   *inside* them. Passwords, bookmarks, history, cookies, extensions and
   IndexedDB are unreachable by design. The browser must be quit first.

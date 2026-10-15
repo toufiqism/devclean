@@ -3,8 +3,8 @@
 devclean - interactive disk cleanup for developer machines.
 
 Scans the usual dev-tooling space hogs (Xcode, iOS simulators, Android SDK,
-Gradle, Chromium browsers, language package caches), shows what each one costs,
-and deletes only what you tick.
+Gradle, Chromium browsers, language package caches, Stremio's streaming cache),
+shows what each one costs, and deletes only what you tick.
 
 Runs on macOS, Linux and Windows. Probes that don't apply to the host are
 skipped, so each platform only ever sees targets that exist on it.
@@ -97,6 +97,54 @@ def quarantine_dir() -> Path:
 
 QUARANTINE_DIR = quarantine_dir()
 
+
+def stremio_cache_dirs() -> list[Path]:
+    """Every directory Stremio's streaming server keeps torrent pieces in.
+
+    Mirrors server.js: settings live in an app directory, pieces in
+    <cacheRoot>/stremio-cache. cacheRoot defaults to the app directory, except
+    that newer servers default to %LOCALAPPDATA%\\Stremio on Windows. Moving the
+    cache from Stremio's settings records the new root in server-settings.json,
+    along with any old roots the server has not finished cleaning.
+    """
+    if IS_MAC:
+        apps = [HOME / "Library" / "Application Support" / "stremio-server"]
+        roots = list(apps)
+    elif IS_WIN:
+        apps = [APPDATA / "stremio" / "stremio-server"]
+        roots = [LOCALAPPDATA / "Stremio"] + apps
+    else:
+        # The Flatpak build persists the same directory inside its sandbox.
+        apps = [HOME / ".stremio-server",
+                HOME / ".var" / "app" / "com.stremio.Stremio" / ".stremio-server"]
+        roots = list(apps)
+
+    for app in apps:
+        try:
+            settings = json.loads((app / "server-settings.json")
+                                  .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(settings, dict):
+            continue
+        old = settings.get("cacheRootsToClean")
+        for r in [settings.get("cacheRoot")] + (old if isinstance(old, list) else []):
+            if isinstance(r, str) and os.path.isabs(r):
+                roots.append(Path(r))
+
+    found: list[Path] = []
+    for r in roots:
+        try:
+            c = (r / "stremio-cache").resolve()
+        except OSError:
+            continue
+        if c.is_dir() and c not in found:
+            found.append(c)
+    return found
+
+
+STREMIO_CACHES = stremio_cache_dirs()
+
 SAFE, REVIEW, MOVE = "SAFE", "REVIEW", "MOVE"
 
 
@@ -177,6 +225,11 @@ for _root in (CACHE_ROOT, CONFIG_ROOT, XDG_DATA, LOCALAPPDATA, APPDATA):
     # Honour relocated cache/config roots that live outside the home directory.
     if _root and _root != HOME and HOME not in _root.parents:
         ALLOW_ROOTS.append(_root)
+for _cache in STREMIO_CACHES:
+    # Stremio offers to move its cache to another drive. Allow exactly that
+    # cache directory, never the drive or folder it was moved into.
+    if not any(r == _cache or r in _cache.parents for r in ALLOW_ROOTS):
+        ALLOW_ROOTS.append(_cache)
 
 
 # --------------------------------------------------------------------------
@@ -944,6 +997,23 @@ def discover_caches() -> list[Target]:
     return out
 
 
+def discover_stremio() -> list[Target]:
+    # Contents only: the directory itself stays, wherever Stremio was told to
+    # put it, and server-settings.json beside it is never in the list.
+    kids = [k for c in STREMIO_CACHES for k in listdir(c)]
+    if not kids:
+        return []
+    if IS_WIN:
+        procs = ["stremio.exe", "stremio-shell-ng.exe",
+                 "stremio-runtime.exe", "stremio-service.exe"]
+    else:
+        procs = ["stremio", "Stremio", "stremio-runtime", "stremio-service"]
+    block = "quit Stremio first" if proc_running(procs) else ""
+    return [Target("stremio", "Caches", "Stremio streaming cache",
+                   "Torrent data from past streams; re-downloaded if you watch again",
+                   SAFE, kids, blocked=block)]
+
+
 # --------------------------------------------------------------------------
 # discovery: junk
 # --------------------------------------------------------------------------
@@ -1012,7 +1082,8 @@ def scan(safe_only: bool) -> list[Target]:
     targets: list[Target] = []
     try:
         probes = (discover_xcode, discover_simulators, discover_android,
-                  discover_browsers, discover_caches, discover_junk)
+                  discover_browsers, discover_caches, discover_stremio,
+                  discover_junk)
 
         def probe(fn):
             try:
