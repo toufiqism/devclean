@@ -155,6 +155,27 @@ cd devclean && git pull && install -m 755 devclean ~/bin/devclean
 Standalone — rerun the same `curl` from your platform's section; it overwrites
 in place.
 
+#### Windows
+
+Rerun only the download, not the whole install block. The `devclean.cmd` shim
+and the `PATH` entry are already in place, and running the block again would
+add the folder to `PATH` a second time. In PowerShell:
+
+```powershell
+curl.exe -fsSL -o "$env:LOCALAPPDATA\Programs\devclean\devclean.py" `
+  https://raw.githubusercontent.com/toufiqism/devclean/main/devclean
+```
+
+If you keep a clone instead, pull and copy the script over the installed one:
+
+```powershell
+cd devclean
+git pull
+Copy-Item devclean "$env:LOCALAPPDATA\Programs\devclean\devclean.py"
+```
+
+Then run `devclean --dry-run` to check the new version starts.
+
 ### Uninstalling
 
 ```sh
